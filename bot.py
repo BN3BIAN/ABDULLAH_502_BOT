@@ -16,7 +16,7 @@ WATCHLIST = [
     "BNAI", "ANPA", "MOBX", "PLTX", "OBAI"
 ]
 
-CHECK_INTERVAL_SECONDS = 300  # كل 5 دقائق
+CHECK_INTERVAL_SECONDS =  60 ثانية = دقيقة واحدة
 MIN_PRICE = 0.30
 MAX_PRICE = 20.0
 MIN_RVOL = 2.0
