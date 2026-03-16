@@ -20,19 +20,17 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.20"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "150"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "5"))
+TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "3"))
 
 MIN_RVOL = float(os.getenv("MIN_RVOL", "0.3"))
 MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "0.3"))
 MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "1000"))
 MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "1000"))
 
-# إعادة التنبيه فقط إذا تحسن فعلي
 REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "0.5"))
 REPEAT_ALERT_MIN_RVOL_DELTA = float(os.getenv("REPEAT_ALERT_MIN_RVOL_DELTA", "0.2"))
 REPEAT_ALERT_MIN_VOL_DELTA_PCT = float(os.getenv("REPEAT_ALERT_MIN_VOL_DELTA_PCT", "10"))
 
-# كشف مبكر قبل الانفجار
 EARLY_BREAKOUT_DISTANCE_PCT = float(os.getenv("EARLY_BREAKOUT_DISTANCE_PCT", "2.0"))
 EARLY_MIN_RVOL = float(os.getenv("EARLY_MIN_RVOL", "0.5"))
 EARLY_MIN_DAY_CHANGE_PCT = float(os.getenv("EARLY_MIN_DAY_CHANGE_PCT", "0.3"))
@@ -57,7 +55,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# تخزين آخر تنبيه لكل سهم
 last_alert_meta = {}
 
 
@@ -714,7 +711,8 @@ def scan_once():
     symbols, gainers_set, active_set = fetch_yahoo_candidates()
     logging.info("Candidates fetched: %s", len(symbols))
 
-    ranked = []
+    filtered_ranked = []
+    fallback_ranked = []
 
     for symbol in symbols:
         try:
@@ -727,35 +725,48 @@ def scan_once():
             if not metrics:
                 continue
 
-            if not is_candidate(metrics):
-                continue
-
             is_gainer = symbol in gainers_set
             is_active = symbol in active_set
             score = score_stock(metrics, is_gainer, is_active)
 
-            ranked.append({
+            item = {
                 "symbol": symbol,
                 "score": score,
                 "metrics": metrics,
                 "is_gainer": is_gainer,
                 "is_active": is_active,
-            })
+            }
 
-            logging.info(
-                "%s | score=%s | type=%s | change=%s | rvol=%s | trend=%s",
-                symbol,
-                score,
-                metrics.get("setup_type"),
-                metrics.get("day_change_pct"),
-                metrics.get("rvol"),
-                metrics.get("trend")
-            )
+            if is_candidate(metrics):
+                filtered_ranked.append(item)
+                logging.info(
+                    "FILTER PASS | %s | score=%s | type=%s | change=%s | rvol=%s | trend=%s",
+                    symbol,
+                    score,
+                    metrics.get("setup_type"),
+                    metrics.get("day_change_pct"),
+                    metrics.get("rvol"),
+                    metrics.get("trend")
+                )
+            else:
+                fallback_ranked.append(item)
+                logging.info(
+                    "FALLBACK KEEP | %s | score=%s | type=%s | change=%s | rvol=%s | trend=%s",
+                    symbol,
+                    score,
+                    metrics.get("setup_type"),
+                    metrics.get("day_change_pct"),
+                    metrics.get("rvol"),
+                    metrics.get("trend")
+                )
 
         except Exception as e:
             logging.exception("Scan error for %s: %s", symbol, e)
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
+    filtered_ranked.sort(key=lambda x: x["score"], reverse=True)
+    fallback_ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    ranked = filtered_ranked if filtered_ranked else fallback_ranked[:TOP_ALERTS_PER_SCAN]
 
     sent_count = 0
     seen_symbols_this_round = set()
@@ -807,7 +818,7 @@ def main():
         "🔎 يبحث في: Top Gainers + Most Active + Fallback\n"
         f"💰 نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}\n"
         "♻️ لا يعيد نفس السهم إلا إذا تحسن فعلاً\n"
-        "💥 ويدعم كشف الأسهم قبل الانفجار"
+        "💥 وإذا لم يجد إشارات قوية سيرسل أفضل الأسهم المتحركة"
     )
     send_telegram_message(startup)
 
