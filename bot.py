@@ -19,19 +19,29 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
-MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "80"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "5"))
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "120"))
+TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "8"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 
-MIN_RVOL = float(os.getenv("MIN_RVOL", "1.2"))
-MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "3.0"))
-MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "15000"))
-MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "50000"))
+# تخفيف بسيط للشروط حتى تظهر أسهم الترند أكثر
+MIN_RVOL = float(os.getenv("MIN_RVOL", "0.8"))
+MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "1.0"))
+MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "5000"))
+MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "10000"))
 
 HALAL_SYMBOLS = {x.strip().upper() for x in os.getenv("HALAL_SYMBOLS", "").split(",") if x.strip()}
 HARAM_SYMBOLS = {x.strip().upper() for x in os.getenv("HARAM_SYMBOLS", "").split(",") if x.strip()}
 
 FMP_API_KEY = os.getenv("FMP_API_KEY", "demo").strip()
+
+# قائمة احتياطية إذا فشلت المصادر
+FALLBACK_SYMBOLS = [
+    "BBAI", "SOUN", "PLTR", "SOFI", "MARA", "RIOT", "LCID", "NIO",
+    "NKLA", "ACHR", "QBTS", "RGTI", "IONQ", "HIMS", "OPEN", "RUN",
+    "FUBO", "ASTS", "DNA", "RXRX", "BMEA", "ALT", "TNXP", "SLS",
+    "HUSA", "UEC", "DNN", "AAPL", "TSLA", "AMD", "NVDA", "SMCI",
+    "INTC", "ABEV", "GRAB", "WULF", "CLS", "KULR", "SERV", "TELL"
+]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -159,6 +169,7 @@ def _clean_symbol_list(symbols):
     for s in symbols:
         if not s:
             continue
+
         s = str(s).strip().upper()
 
         if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s):
@@ -285,7 +296,14 @@ def fetch_yahoo_candidates() -> tuple[list[str], set[str], set[str]]:
 
     if not ordered:
         logging.info("Yahoo returned 0 candidates, switching to FMP fallback...")
-        return fetch_fmp_candidates()
+        ordered, gainers_set, active_set = fetch_fmp_candidates()
+
+        if not ordered:
+            logging.info("FMP also returned 0 candidates, switching to fallback symbol list...")
+            fallback = _clean_symbol_list(FALLBACK_SYMBOLS)
+            return fallback[:MAX_CANDIDATES], set(), set()
+
+        return ordered, gainers_set, active_set
 
     return ordered, gainers_set, active_set
 
@@ -388,21 +406,21 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
 
         if day_change_pct >= 8 and rvol >= 2:
             momentum = "عالي جدًا"
-        elif day_change_pct >= 4 and rvol >= 1.5:
+        elif day_change_pct >= 4 and rvol >= 1.3:
             momentum = "عالي"
-        elif day_change_pct >= 2:
+        elif day_change_pct >= 1:
             momentum = "متوسط"
         else:
             momentum = "ضعيف"
 
-        if minute_change_pct >= 0.7 and last_min_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
+        if minute_change_pct >= 0.5 and last_min_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
             whale = "نعم 🐳"
-        elif rvol >= 3 and last_min_dollar_vol >= (MIN_LAST_MIN_DOLLAR_VOL * 2):
+        elif rvol >= 2 and last_min_dollar_vol >= (MIN_LAST_MIN_DOLLAR_VOL * 1.5):
             whale = "محتمل 🐳"
         else:
             whale = "لا"
 
-        if price > vwap and day_change_pct > 0 and rvol >= 1.3:
+        if price > vwap and day_change_pct > 0 and rvol >= 1.0:
             trend = "صعود"
         elif price < vwap and day_change_pct < 0:
             trend = "هبوط"
@@ -412,7 +430,7 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         recent_high = safe_float(df["High"].tail(15).max(), price)
         trigger = round(recent_high + 0.01, 4)
 
-        if trend == "صعود" and momentum in {"عالي", "عالي جدًا"} and whale != "لا":
+        if trend == "صعود" and momentum in {"عالي", "عالي جدًا"}:
             entry = "مناسب لدخول سريع بحذر"
         elif price < recent_high:
             entry = f"انتظار اختراق {trigger}"
@@ -624,7 +642,7 @@ def main():
 
     startup = (
         "✅ البوت اشتغل وبدأ فحص السوق الأمريكي\n"
-        "يشمل: Top Gainers + Most Active\n"
+        "يشمل: Top Gainers + Most Active + Fallback\n"
         f"نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}"
     )
     send_telegram_message(startup)
