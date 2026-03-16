@@ -27,10 +27,15 @@ MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "1.0"))
 MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "5000"))
 MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "10000"))
 
-# شروط إعادة نفس السهم فقط إذا تحسن فعلاً
+# إعادة التنبيه فقط إذا تحسن فعلي
 REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "1.0"))
 REPEAT_ALERT_MIN_RVOL_DELTA = float(os.getenv("REPEAT_ALERT_MIN_RVOL_DELTA", "0.5"))
 REPEAT_ALERT_MIN_VOL_DELTA_PCT = float(os.getenv("REPEAT_ALERT_MIN_VOL_DELTA_PCT", "30"))
+
+# كشف مبكر قبل الانفجار
+EARLY_BREAKOUT_DISTANCE_PCT = float(os.getenv("EARLY_BREAKOUT_DISTANCE_PCT", "1.2"))
+EARLY_MIN_RVOL = float(os.getenv("EARLY_MIN_RVOL", "0.9"))
+EARLY_MIN_DAY_CHANGE_PCT = float(os.getenv("EARLY_MIN_DAY_CHANGE_PCT", "0.5"))
 
 HALAL_SYMBOLS = {x.strip().upper() for x in os.getenv("HALAL_SYMBOLS", "").split(",") if x.strip()}
 HARAM_SYMBOLS = {x.strip().upper() for x in os.getenv("HARAM_SYMBOLS", "").split(",") if x.strip()}
@@ -52,21 +57,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# تخزين آخر بصمة تنبيه لكل سهم
 last_alert_meta = {}
-# مثال:
-# {
-#   "SLS": {
-#       "price": 5.41,
-#       "count": 1,
-#       "rvol": 1.2,
-#       "last_1m_vol": 120000,
-#       "trend": "انتظار",
-#       "trigger": 5.52,
-#       "news": "لا يوجد خبر",
-#       "time": "..."
-#   }
-# }
 
 
 # =========================
@@ -432,6 +423,9 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         float_shares = safe_int(info.get("floatShares", 0))
 
         last_1m_dollar_vol = price * last_1m_vol
+        recent_high = safe_float(df["High"].tail(15).max(), price)
+        breakout_distance_pct = ((recent_high - price) / price) * 100 if price > 0 else 999.0
+        trigger = round(recent_high + 0.01, 4)
 
         if day_change_pct >= 8 and rvol_1m >= 2:
             momentum = "عالي جدًا"
@@ -456,15 +450,26 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         else:
             trend = "انتظار"
 
-        recent_high = safe_float(df["High"].tail(15).max(), price)
-        trigger = round(recent_high + 0.01, 4)
-
         if trend == "صعود" and momentum in {"عالي", "عالي جدًا"}:
             entry = "دخول سريع بحذر"
-        elif price < recent_high:
-            entry = f"انتظار اختراق {trigger}"
+        elif breakout_distance_pct <= EARLY_BREAKOUT_DISTANCE_PCT:
+            entry = f"قريب من اختراق {trigger}"
         else:
             entry = "انتظار"
+
+        # نوع الفرصة
+        if price <= 5 and rvol_1m >= 1.0 and last_1m_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
+            setup_type = "سكالب"
+        elif trend == "صعود" and momentum in {"عالي", "عالي جدًا"} and price > 3:
+            setup_type = "مومنتم"
+        elif (
+            breakout_distance_pct <= EARLY_BREAKOUT_DISTANCE_PCT
+            and day_change_pct >= EARLY_MIN_DAY_CHANGE_PCT
+            and rvol_1m >= EARLY_MIN_RVOL
+        ):
+            setup_type = "قبل الانفجار"
+        else:
+            setup_type = "مراقبة"
 
         if symbol in HALAL_SYMBOLS:
             sharia = "شرعي"
@@ -491,6 +496,8 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
             "trend": trend,
             "entry": entry,
             "trigger": trigger,
+            "breakout_distance_pct": round(breakout_distance_pct, 2),
+            "setup_type": setup_type,
             "sharia": sharia,
             "business_ar": business_arabic(info),
         }
@@ -515,6 +522,8 @@ def is_candidate(metrics: dict) -> bool:
         rules_hit += 1
     if metrics["trend"] == "صعود":
         rules_hit += 1
+    if metrics["setup_type"] == "قبل الانفجار":
+        rules_hit += 1
 
     return rules_hit >= 2
 
@@ -534,24 +543,27 @@ def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
         score += 8
     if is_active:
         score += 8
+    if metrics["setup_type"] == "قبل الانفجار":
+        score += 10
+    elif metrics["setup_type"] == "سكالب":
+        score += 7
+    elif metrics["setup_type"] == "مومنتم":
+        score += 9
 
     return round(score, 2)
 
 
 # =========================
-# منع التكرار المتطابق
+# منع التكرار
 # =========================
 def get_repeat_number(symbol: str, metrics: dict, news_title: str) -> int | None:
-    """
-    أول مرة: 1
-    ثاني مرة أو أكثر: فقط إذا حصل تحسن حقيقي
-    """
     old = last_alert_meta.get(symbol)
     current_price = safe_float(metrics["price"], 0.0)
     current_rvol = safe_float(metrics["rvol"], 0.0)
     current_vol = safe_int(metrics["last_1m_vol"], 0)
     current_trend = metrics["trend"]
     current_trigger = safe_float(metrics["trigger"], 0.0)
+    current_setup = metrics["setup_type"]
 
     if old is None:
         return 1
@@ -563,6 +575,7 @@ def get_repeat_number(symbol: str, metrics: dict, news_title: str) -> int | None
     old_trend = old.get("trend", "")
     old_trigger = safe_float(old.get("trigger"), 0.0)
     old_news = old.get("news", "")
+    old_setup = old.get("setup_type", "")
 
     improved = False
 
@@ -587,6 +600,9 @@ def get_repeat_number(symbol: str, metrics: dict, news_title: str) -> int | None
     if abs(current_trigger - old_trigger) >= 0.01:
         improved = True
 
+    if current_setup != old_setup:
+        improved = True
+
     if news_title and news_title != "لا يوجد خبر" and news_title != old_news:
         improved = True
 
@@ -605,6 +621,7 @@ def mark_repeat_alert(symbol: str, metrics: dict, news_title: str, repeat_number
         "trend": metrics["trend"],
         "trigger": safe_float(metrics["trigger"], 0.0),
         "news": news_title,
+        "setup_type": metrics["setup_type"],
         "time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -620,6 +637,15 @@ def build_alert_text(metrics: dict, is_gainer: bool, is_active: bool, news_title
     else:
         top_line.append(f"🚨 تنبيه {repeat_number}")
         top_line.append(f"📈 صعود {repeat_number}")
+
+    if metrics["setup_type"] == "سكالب":
+        top_line.append("⚡ سكالب")
+    elif metrics["setup_type"] == "مومنتم":
+        top_line.append("🚀 مومنتم")
+    elif metrics["setup_type"] == "قبل الانفجار":
+        top_line.append("💥 قبل الانفجار")
+    else:
+        top_line.append("👀 مراقبة")
 
     if is_gainer:
         top_line.append("🔥 الأكثر ارتفاعًا")
@@ -645,19 +671,22 @@ def build_alert_text(metrics: dict, is_gainer: bool, is_active: bool, news_title
         f"📊 التغير اليومي: {pct_str(metrics['day_change_pct'])}",
         f"🎯 القرار: {metrics['entry']}",
         "",
-        f"⚡ الزخم: {metrics['momentum']}",
+        f"⚡ نوع الفرصة: {metrics['setup_type']}",
+        f"🔥 الزخم: {metrics['momentum']}",
         f"🏢 أسهم الشركة: {fmt_num(metrics['shares_outstanding'])}",
         f"📦 الأسهم المطروحة: {fmt_num(metrics['float_shares'])}",
         f"🔁 حجم التداول اليوم: {fmt_num(metrics['day_volume'])}",
         f"💧 سيولة آخر دقيقة: {fmt_num(metrics['last_1m_vol'])}",
-        f"🔥 قوة السيولة: {metrics['liquidity_power']}x",
         f"📏 RVOL: {metrics['rvol']}",
+        f"💦 قوة السيولة: {metrics['liquidity_power']}x",
         f"🕌 الشرعية: {metrics['sharia']}",
         f"🐳 دخول حوت: {metrics['whale']}",
         f"🏭 عمل الشركة: {metrics['business_ar']}",
         f"📰 الخبر: {news_title if news_title else 'لا يوجد خبر'}",
         f"📍 الاتجاه: {metrics['trend']}",
         f"📌 VWAP: {metrics['vwap']}",
+        f"🎯 مسافة الاختراق: {metrics['breakout_distance_pct']}%",
+        f"🚪 اختراق عند: {metrics['trigger']}",
     ])
 
 
@@ -697,9 +726,10 @@ def scan_once():
             })
 
             logging.info(
-                "%s | score=%s | change=%s | rvol=%s | trend=%s",
+                "%s | score=%s | type=%s | change=%s | rvol=%s | trend=%s",
                 symbol,
                 score,
+                metrics["setup_type"],
                 metrics["day_change_pct"],
                 metrics["rvol"],
                 metrics["trend"]
@@ -745,10 +775,11 @@ def main():
         return
 
     startup = (
-        "✅ البوت اشتغل وبدأ فحص السوق الأمريكي\n"
+        "✅ البوت اشتغل وبدأ Smart Market Scanner\n"
         "🔎 يبحث في: Top Gainers + Most Active + Fallback\n"
         f"💰 نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}\n"
-        "♻️ لا يعيد نفس السهم إلا إذا تحسن فعلاً"
+        "♻️ لا يعيد نفس السهم إلا إذا تحسن فعلاً\n"
+        "💥 ويدعم كشف الأسهم قبل الانفجار"
     )
     send_telegram_message(startup)
 
