@@ -1,202 +1,298 @@
 import os
 import time
-import math
-import traceback
+import logging
 from datetime import datetime
 
 import requests
+import pandas as pd
 import yfinance as yf
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "718432991").strip()
 
-# تقدر تعدل قائمة الأسهم هنا
-WATCHLIST = [
-    "IPW", "ANY", "TLYS", "EONR", "ACXP", "ASNS", "DXST",
-    "BNAI", "ANPA", "MOBX", "PLTX", "OBAI"
+# =========================
+# الإعدادات
+# =========================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# ضع الأسهم هنا أو من متغير Railway باسم STOCK_SYMBOLS
+DEFAULT_SYMBOLS = ["BNAI", "ANPA", "ASNS", "DXST"]
+STOCK_SYMBOLS = [
+    s.strip().upper()
+    for s in os.getenv("STOCK_SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",")
+    if s.strip()
 ]
 
-CHECK_INTERVAL_SECONDS =  60 ثانية = دقيقة واحدة
-MIN_PRICE = 0.30
-MAX_PRICE = 20.0
-MIN_RVOL = 2.0
-MIN_CHANGE_PCT = 4.0
-MIN_VOLUME = 300_000
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # بالثواني
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.2"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
+MIN_RVOL = float(os.getenv("MIN_RVOL", "2.0"))
+MIN_CHANGE_PCT = float(os.getenv("MIN_CHANGE_PCT", "2.0"))
+MIN_VOLUME_SPIKE = float(os.getenv("MIN_VOLUME_SPIKE", "1.8"))
 
-sent_cache = {}
-
-
-def send_telegram_message(text: str) -> None:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("BOT_TOKEN أو CHAT_ID غير موجود")
-        return
-
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=20)
-        print("Telegram:", r.status_code, r.text[:200])
-    except Exception as e:
-        print("Telegram send failed:", e)
+# منع التكرار لنفس السهم خلال مدة قصيرة
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "15"))
 
 
-def safe_float(value, default=0.0):
-    try:
-        if value is None or (isinstance(value, float) and math.isnan(value)):
-            return default
-        return float(value)
-    except Exception:
-        return default
+# =========================
+# اللوق
+# =========================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
 
-def get_history(symbol: str):
-    try:
-        ticker = yf.Ticker(symbol)
-        df = ticker.history(period="5d", interval="5m", auto_adjust=False, prepost=True)
-        if df is None or df.empty:
-            return None
-        return df
-    except Exception as e:
-        print(f"{symbol} history error:", e)
-        return None
+# =========================
+# تخزين آخر تنبيه
+# =========================
+last_alert_time = {}
 
 
-def analyze_symbol(symbol: str):
-    df = get_history(symbol)
-    if df is None or len(df) < 30:
-        return None
-
-    close = safe_float(df["Close"].iloc[-1])
-    prev_close = safe_float(df["Close"].iloc[-2])
-    high = safe_float(df["High"].iloc[-1])
-    low = safe_float(df["Low"].iloc[-1])
-    volume = safe_float(df["Volume"].iloc[-1])
-
-    avg_volume = safe_float(df["Volume"].tail(20).mean(), 1.0)
-    rvol = volume / avg_volume if avg_volume > 0 else 0.0
-    change_pct = ((close - prev_close) / prev_close * 100.0) if prev_close > 0 else 0.0
-
-    # VWAP تقريبي للجلسة الحالية من الداتا المتاحة
-    typical_price = (df["High"] + df["Low"] + df["Close"]) / 3.0
-    cum_tpv = (typical_price * df["Volume"]).cumsum()
-    cum_vol = df["Volume"].cumsum().replace(0, 1)
-    vwap = safe_float((cum_tpv / cum_vol).iloc[-1])
-
-    # زخم بسيط
-    ema9 = safe_float(df["Close"].ewm(span=9, adjust=False).mean().iloc[-1])
-    ema20 = safe_float(df["Close"].ewm(span=20, adjust=False).mean().iloc[-1])
-
-    # اختراق آخر 20 شمعة
-    recent_high = safe_float(df["High"].tail(20).max())
-    breakout = close >= recent_high * 0.995
-
-    # قوة الشمعة الحالية
-    candle_body = abs(close - safe_float(df["Open"].iloc[-1]))
-    candle_range = max(high - low, 0.0001)
-    body_strength = candle_body / candle_range
-
-    bullish = close > ema9 and ema9 > ema20 and close > vwap
-    strong_move = (
-        close >= MIN_PRICE and
-        close <= MAX_PRICE and
-        volume >= MIN_VOLUME and
-        rvol >= MIN_RVOL and
-        change_pct >= MIN_CHANGE_PCT and
-        bullish and
-        body_strength >= 0.45
-    )
-
-    if not strong_move:
-        return None
-
-    score = 0
-    score += 25 if rvol >= 3 else 15
-    score += 20 if change_pct >= 8 else 12
-    score += 15 if close > vwap else 0
-    score += 15 if ema9 > ema20 else 0
-    score += 15 if breakout else 5
-    score += 10 if body_strength >= 0.6 else 5
-
-    result = {
-        "symbol": symbol,
-        "price": round(close, 4),
-        "change_pct": round(change_pct, 2),
-        "rvol": round(rvol, 2),
-        "volume": int(volume),
-        "vwap": round(vwap, 4),
-        "ema9": round(ema9, 4),
-        "ema20": round(ema20, 4),
-        "breakout": breakout,
-        "score": min(score, 100),
-    }
-    return result
-
-
-def should_send(symbol: str, score: int, price: float) -> bool:
-    now_bucket = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
-    key = f"{symbol}:{score // 10}:{round(price, 2)}"
-    last_sent = sent_cache.get(symbol)
-
-    if last_sent == key:
+# =========================
+# تيليجرام
+# =========================
+def send_telegram_message(text: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("TELEGRAM_BOT_TOKEN أو TELEGRAM_CHAT_ID غير موجود.")
         return False
 
-    sent_cache[symbol] = key
-    return True
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=20)
+        if response.status_code == 200:
+            logging.info("تم إرسال رسالة تيليجرام بنجاح.")
+            return True
+        logging.error("فشل إرسال الرسالة: %s | %s", response.status_code, response.text)
+        return False
+    except Exception as e:
+        logging.exception("خطأ أثناء إرسال تيليجرام: %s", e)
+        return False
 
 
-def format_alert(data: dict) -> str:
-    breakout_text = "نعم" if data["breakout"] else "لا"
+# =========================
+# تحميل البيانات
+# =========================
+def get_stock_data(symbol: str) -> pd.DataFrame | None:
+    try:
+        df = yf.download(
+            tickers=symbol,
+            period="1d",
+            interval="1m",
+            progress=False,
+            auto_adjust=False,
+            threads=False
+        )
+
+        if df is None or df.empty:
+            logging.warning("%s | لا توجد بيانات.", symbol)
+            return None
+
+        # إذا رجعت MultiIndex
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        required_cols = ["Open", "High", "Low", "Close", "Volume"]
+        missing = [c for c in required_cols if c not in df.columns]
+        if missing:
+            logging.warning("%s | أعمدة ناقصة: %s", symbol, missing)
+            return None
+
+        df = df.dropna().copy()
+        if df.empty:
+            logging.warning("%s | البيانات بعد التنظيف فارغة.", symbol)
+            return None
+
+        return df
+
+    except Exception as e:
+        logging.exception("%s | خطأ أثناء جلب البيانات: %s", symbol, e)
+        return None
+
+
+# =========================
+# حساب المؤشرات
+# =========================
+def compute_metrics(df: pd.DataFrame) -> dict | None:
+    try:
+        df = df.copy()
+
+        typical_price = (df["High"] + df["Low"] + df["Close"]) / 3
+        df["TPV"] = typical_price * df["Volume"]
+        df["VWAP"] = df["TPV"].cumsum() / df["Volume"].replace(0, pd.NA).cumsum()
+
+        df["AvgVol20"] = df["Volume"].rolling(20).mean()
+        df["RVOL"] = df["Volume"] / df["AvgVol20"]
+
+        latest = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) > 1 else latest
+        first = df.iloc[0]
+
+        price = float(latest["Close"])
+        vwap = float(latest["VWAP"]) if pd.notna(latest["VWAP"]) else 0.0
+        volume = float(latest["Volume"])
+        avg_vol20 = float(latest["AvgVol20"]) if pd.notna(latest["AvgVol20"]) else 0.0
+        rvol = float(latest["RVOL"]) if pd.notna(latest["RVOL"]) else 0.0
+
+        day_change_pct = ((price - float(first["Open"])) / float(first["Open"])) * 100 if float(first["Open"]) != 0 else 0.0
+        minute_change_pct = ((price - float(prev["Close"])) / float(prev["Close"])) * 100 if float(prev["Close"]) != 0 else 0.0
+        volume_spike = (volume / avg_vol20) if avg_vol20 > 0 else 0.0
+
+        return {
+            "price": round(price, 4),
+            "vwap": round(vwap, 4),
+            "volume": int(volume),
+            "avg_vol20": int(avg_vol20) if avg_vol20 > 0 else 0,
+            "rvol": round(rvol, 2),
+            "day_change_pct": round(day_change_pct, 2),
+            "minute_change_pct": round(minute_change_pct, 2),
+            "volume_spike": round(volume_spike, 2),
+        }
+
+    except Exception as e:
+        logging.exception("خطأ أثناء حساب المؤشرات: %s", e)
+        return None
+
+
+# =========================
+# فلترة الإشارة
+# =========================
+def evaluate_signal(symbol: str, metrics: dict) -> tuple[bool, str]:
+    price = metrics["price"]
+    vwap = metrics["vwap"]
+    rvol = metrics["rvol"]
+    day_change_pct = metrics["day_change_pct"]
+    volume_spike = metrics["volume_spike"]
+
+    reasons = []
+
+    if not (MIN_PRICE <= price <= MAX_PRICE):
+        reasons.append(f"السعر خارج النطاق ({price})")
+    else:
+        reasons.append(f"السعر مناسب ({price})")
+
+    if price > vwap:
+        reasons.append(f"فوق VWAP ({vwap})")
+    else:
+        reasons.append(f"تحت VWAP ({vwap})")
+
+    if rvol >= MIN_RVOL:
+        reasons.append(f"RVOL قوي ({rvol})")
+    else:
+        reasons.append(f"RVOL ضعيف ({rvol})")
+
+    if day_change_pct >= MIN_CHANGE_PCT:
+        reasons.append(f"زخم يومي جيد ({day_change_pct}%)")
+    else:
+        reasons.append(f"زخم يومي ضعيف ({day_change_pct}%)")
+
+    if volume_spike >= MIN_VOLUME_SPIKE:
+        reasons.append(f"فوليوم قوي ({volume_spike}x)")
+    else:
+        reasons.append(f"فوليوم ضعيف ({volume_spike}x)")
+
+    passed = (
+        MIN_PRICE <= price <= MAX_PRICE
+        and price > vwap
+        and rvol >= MIN_RVOL
+        and day_change_pct >= MIN_CHANGE_PCT
+        and volume_spike >= MIN_VOLUME_SPIKE
+    )
+
+    return passed, " | ".join(reasons)
+
+
+# =========================
+# منع تكرار التنبيه
+# =========================
+def can_send_alert(symbol: str) -> bool:
+    now = datetime.utcnow()
+    last_time = last_alert_time.get(symbol)
+
+    if last_time is None:
+        return True
+
+    minutes_passed = (now - last_time).total_seconds() / 60
+    return minutes_passed >= COOLDOWN_MINUTES
+
+
+def mark_alert_sent(symbol: str):
+    last_alert_time[symbol] = datetime.utcnow()
+
+
+# =========================
+# رسالة التنبيه
+# =========================
+def build_alert_message(symbol: str, metrics: dict) -> str:
     return (
-        f"🚨 <b>تنبيه سهم زخم</b>\n\n"
-        f"• السهم: <b>{data['symbol']}</b>\n"
-        f"• السعر: <b>{data['price']}</b>\n"
-        f"• التغير: <b>{data['change_pct']}%</b>\n"
-        f"• RVOL: <b>{data['rvol']}</b>\n"
-        f"• الفوليوم: <b>{data['volume']:,}</b>\n"
-        f"• VWAP: <b>{data['vwap']}</b>\n"
-        f"• EMA9 / EMA20: <b>{data['ema9']} / {data['ema20']}</b>\n"
-        f"• اختراق: <b>{breakout_text}</b>\n"
-        f"• السكور: <b>{data['score']}/100</b>\n\n"
-        f"مناسب للمراقبة السريعة، وليس دخولًا مضمونًا."
+        f"🚨 إشارة قوية\n\n"
+        f"السهم: {symbol}\n"
+        f"السعر: {metrics['price']}\n"
+        f"VWAP: {metrics['vwap']}\n"
+        f"RVOL: {metrics['rvol']}\n"
+        f"التغير اليومي: {metrics['day_change_pct']}%\n"
+        f"فوليوم آخر دقيقة: {metrics['volume']}\n"
+        f"قوة الفوليوم: {metrics['volume_spike']}x\n"
     )
 
 
-def scan_market():
-    found = []
-    for symbol in WATCHLIST:
-        try:
-            data = analyze_symbol(symbol)
-            if not data:
-                continue
-            found.append(data)
-        except Exception:
-            print(f"Error analyzing {symbol}")
-            traceback.print_exc()
+# =========================
+# الفحص
+# =========================
+def scan_once():
+    logging.info("جار فحص الأسهم...")
 
-    found.sort(key=lambda x: (x["score"], x["rvol"], x["change_pct"]), reverse=True)
+    for symbol in STOCK_SYMBOLS:
+        df = get_stock_data(symbol)
+        if df is None:
+            logging.info("%s | لا توجد بيانات كافية.", symbol)
+            continue
 
-    for item in found[:5]:
-        if should_send(item["symbol"], item["score"], item["price"]):
-            send_telegram_message(format_alert(item))
+        metrics = compute_metrics(df)
+        if metrics is None:
+            logging.info("%s | تعذر حساب المؤشرات.", symbol)
+            continue
+
+        passed, details = evaluate_signal(symbol, metrics)
+        logging.info("%s | %s", symbol, details)
+
+        if passed:
+            if can_send_alert(symbol):
+                message = build_alert_message(symbol, metrics)
+                sent = send_telegram_message(message)
+                if sent:
+                    mark_alert_sent(symbol)
+                    logging.info("%s | تم إرسال تنبيه.", symbol)
+            else:
+                logging.info("%s | الإشارة موجودة لكن داخل فترة التبريد.", symbol)
 
 
+# =========================
+# التشغيل الرئيسي
+# =========================
 def main():
-    print("Stock bot started...")
-    send_telegram_message("✅ البوت اشتغل على السيرفر بنجاح")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("أضف TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID في Railway Variables.")
+        return
+
+    logging.info("تم تشغيل البوت.")
+    logging.info("الأسهم الحالية: %s", ", ".join(STOCK_SYMBOLS))
+    logging.info("مدة الفحص: %s ثانية", CHECK_INTERVAL)
+
+    # رسالة بدء اختيارية
+    send_telegram_message("✅ البوت اشتغل وبدأ فحص الأسهم.")
 
     while True:
         try:
-            print("Scanning stocks...", datetime.utcnow().isoformat())
-            scan_market()
-        except Exception:
-            traceback.print_exc()
-            send_telegram_message("⚠️ صار خطأ داخل البوت، لكن جاري المحاولة من جديد.")
-        time.sleep(CHECK_INTERVAL_SECONDS)
+            scan_once()
+        except Exception as e:
+            logging.exception("خطأ في الحلقة الرئيسية: %s", e)
+
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
