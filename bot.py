@@ -20,21 +20,21 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "120"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "8"))
-COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
+TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "2"))
 
-# تخفيف بسيط للشروط حتى تظهر أسهم الترند أكثر
 MIN_RVOL = float(os.getenv("MIN_RVOL", "0.8"))
 MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "1.0"))
 MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "5000"))
 MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "10000"))
+
+# فرق الارتفاع المطلوب لإعادة تنبيه نفس السهم
+REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "0.8"))
 
 HALAL_SYMBOLS = {x.strip().upper() for x in os.getenv("HALAL_SYMBOLS", "").split(",") if x.strip()}
 HARAM_SYMBOLS = {x.strip().upper() for x in os.getenv("HARAM_SYMBOLS", "").split(",") if x.strip()}
 
 FMP_API_KEY = os.getenv("FMP_API_KEY", "demo").strip()
 
-# قائمة احتياطية إذا فشلت المصادر
 FALLBACK_SYMBOLS = [
     "BBAI", "SOUN", "PLTR", "SOFI", "MARA", "RIOT", "LCID", "NIO",
     "NKLA", "ACHR", "QBTS", "RGTI", "IONQ", "HIMS", "OPEN", "RUN",
@@ -52,7 +52,12 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-last_alert_time = {}
+# حفظ آخر تنبيه لكل سهم
+last_alert_meta = {}
+# مثال:
+# {
+#   "MARA": {"price": 9.68, "count": 1, "time": datetime.utcnow()}
+# }
 
 
 # =========================
@@ -86,8 +91,7 @@ def pct_str(x) -> str:
         x = float(x)
     except Exception:
         return "0%"
-    s = f"{x:+.2f}%"
-    return s.replace("+0.00%", "0%")
+    return f"{x:+.2f}%"
 
 
 def safe_float(x, default=0.0):
@@ -119,22 +123,9 @@ def get_session_label() -> str:
             return "وقت السوق"
         if 16 * 60 <= hm < 20 * 60:
             return "بعد الإغلاق"
-        return "خارج الجلسات الرئيسية"
+        return "خارج الجلسة"
     except Exception:
         return "غير محدد"
-
-
-def can_send_alert(symbol: str) -> bool:
-    now = datetime.now(timezone.utc)
-    last_time = last_alert_time.get(symbol)
-    if last_time is None:
-        return True
-    minutes_passed = (now - last_time).total_seconds() / 60
-    return minutes_passed >= COOLDOWN_MINUTES
-
-
-def mark_alert_sent(symbol: str):
-    last_alert_time[symbol] = datetime.now(timezone.utc)
 
 
 def send_telegram_message(text: str) -> bool:
@@ -160,6 +151,50 @@ def send_telegram_message(text: str) -> bool:
 
 
 # =========================
+# ترجمة عمل الشركة
+# =========================
+SECTOR_MAP = {
+    "Technology": "تقنية",
+    "Healthcare": "رعاية صحية",
+    "Financial Services": "خدمات مالية",
+    "Industrials": "صناعات",
+    "Energy": "طاقة",
+    "Consumer Cyclical": "استهلاكي دوري",
+    "Consumer Defensive": "استهلاكي أساسي",
+    "Communication Services": "خدمات اتصالات",
+    "Basic Materials": "مواد أساسية",
+    "Real Estate": "عقارات",
+    "Utilities": "مرافق",
+}
+
+INDUSTRY_MAP = {
+    "Capital Markets": "أسواق مالية وخدمات استثمار",
+    "Biotechnology": "تقنية حيوية وتطوير أدوية",
+    "Semiconductors": "أشباه موصلات ورقائق إلكترونية",
+    "Software - Infrastructure": "برمجيات وبنية تحتية رقمية",
+    "Software - Application": "برمجيات وتطبيقات",
+    "Auto Manufacturers": "تصنيع سيارات",
+    "Solar": "طاقة شمسية",
+    "Oil & Gas E&P": "استكشاف وإنتاج النفط والغاز",
+    "Uranium": "يورانيوم وطاقة نووية",
+    "Medical Devices": "أجهزة ومستلزمات طبية",
+    "Drug Manufacturers - Specialty & Generic": "تصنيع أدوية متخصصة وعامة",
+}
+
+
+def business_arabic(info: dict) -> str:
+    sector = (info.get("sector") or "").strip()
+    industry = (info.get("industry") or "").strip()
+
+    sector_ar = SECTOR_MAP.get(sector, sector if sector else "غير متوفر")
+    industry_ar = INDUSTRY_MAP.get(industry, industry if industry else "غير متوفر")
+
+    if industry_ar != "غير متوفر":
+        return f"تعمل الشركة في مجال {industry_ar} ضمن قطاع {sector_ar}"
+    return f"تعمل الشركة في قطاع {sector_ar}"
+
+
+# =========================
 # جلب المرشحين
 # =========================
 def _clean_symbol_list(symbols):
@@ -171,7 +206,6 @@ def _clean_symbol_list(symbols):
             continue
 
         s = str(s).strip().upper()
-
         if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s):
             continue
 
@@ -187,17 +221,16 @@ def _extract_symbols_from_table(df: pd.DataFrame) -> list[str]:
     possible_cols = [c for c in df.columns if str(c).strip().lower() in {"symbol", "ticker"}]
 
     if possible_cols:
-        col = possible_cols[0]
-        vals = df[col].astype(str).tolist()
+        vals = df[possible_cols[0]].astype(str).tolist()
     else:
         vals = []
         for col in df.columns:
             vals.extend(df[col].astype(str).tolist())
 
     for v in vals:
-        m = re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", v.strip().upper())
-        if m:
-            candidates.append(v.strip().upper())
+        s = v.strip().upper()
+        if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s):
+            candidates.append(s)
 
     return candidates
 
@@ -263,14 +296,11 @@ def fetch_yahoo_candidates() -> tuple[list[str], set[str], set[str]]:
 
     for kind, url_list in urls.items():
         collected = []
-
         for url in url_list:
             try:
                 tables = pd.read_html(url)
                 for df in tables:
-                    syms = _extract_symbols_from_table(df)
-                    collected.extend(syms)
-
+                    collected.extend(_extract_symbols_from_table(df))
                 if collected:
                     break
             except Exception:
@@ -344,23 +374,18 @@ def get_intraday(symbol: str) -> pd.DataFrame | None:
 
 def get_info_fast(symbol: str) -> dict:
     try:
-        t = yf.Ticker(symbol)
-        info = t.info or {}
-        return info
+        return yf.Ticker(symbol).info or {}
     except Exception:
         return {}
 
 
 def get_news_headline(symbol: str) -> str:
     try:
-        t = yf.Ticker(symbol)
-        items = t.news or []
+        items = yf.Ticker(symbol).news or []
         if not items:
             return "لا يوجد خبر"
         title = items[0].get("title") or ""
-        if not title:
-            return "لا يوجد خبر"
-        return title[:180]
+        return title[:160] if title else "لا يوجد خبر"
     except Exception:
         return "لا يوجد خبر"
 
@@ -374,17 +399,20 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         vol_cum = df["Volume"].replace(0, pd.NA).cumsum()
         df["VWAP"] = df["TPV"].cumsum() / vol_cum
 
-        df["AvgVol20"] = df["Volume"].rolling(20).mean()
-        df["RVOL"] = df["Volume"] / df["AvgVol20"]
+        # لحظي من نفس الدقيقة
+        df["AvgVol20_1m"] = df["Volume"].replace(0, pd.NA).rolling(20).mean()
+        df["RVOL_1m"] = df["Volume"] / df["AvgVol20_1m"]
 
         latest = df.iloc[-1]
         prev = df.iloc[-2] if len(df) > 1 else latest
 
         price = safe_float(latest["Close"])
         vwap = safe_float(latest["VWAP"])
-        last_min_vol = safe_int(latest["Volume"])
-        avg_vol20 = safe_float(latest["AvgVol20"])
-        rvol = safe_float(latest["RVOL"])
+
+        last_1m_vol = safe_int(latest["Volume"])
+        rvol_1m = safe_float(latest["RVOL_1m"])
+        liquidity_power = rvol_1m if rvol_1m > 0 else 0.0
+
         minute_change_pct = ((price - safe_float(prev["Close"])) / safe_float(prev["Close"], 1)) * 100
 
         today_open = safe_float(df.iloc[0]["Open"], price)
@@ -396,31 +424,26 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
 
         shares_outstanding = safe_int(info.get("sharesOutstanding", 0))
         float_shares = safe_int(info.get("floatShares", 0))
-        company_name = info.get("shortName") or info.get("longName") or symbol
-        industry = info.get("industry") or info.get("sector") or "غير متوفر"
-        summary = info.get("longBusinessSummary") or ""
-        market_cap = safe_int(info.get("marketCap", 0))
 
-        last_min_dollar_vol = price * last_min_vol
-        liquidity_power = (last_min_vol / avg_vol20) if avg_vol20 > 0 else 0.0
+        last_1m_dollar_vol = price * last_1m_vol
 
-        if day_change_pct >= 8 and rvol >= 2:
+        if day_change_pct >= 8 and rvol_1m >= 2:
             momentum = "عالي جدًا"
-        elif day_change_pct >= 4 and rvol >= 1.3:
+        elif day_change_pct >= 4 and rvol_1m >= 1.2:
             momentum = "عالي"
         elif day_change_pct >= 1:
             momentum = "متوسط"
         else:
             momentum = "ضعيف"
 
-        if minute_change_pct >= 0.5 and last_min_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
+        if minute_change_pct >= 0.5 and last_1m_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
             whale = "نعم 🐳"
-        elif rvol >= 2 and last_min_dollar_vol >= (MIN_LAST_MIN_DOLLAR_VOL * 1.5):
+        elif rvol_1m >= 1.8 and last_1m_dollar_vol >= (MIN_LAST_MIN_DOLLAR_VOL * 1.2):
             whale = "محتمل 🐳"
         else:
             whale = "لا"
 
-        if price > vwap and day_change_pct > 0 and rvol >= 1.0:
+        if price > vwap and day_change_pct > 0 and rvol_1m >= 1.0:
             trend = "صعود"
         elif price < vwap and day_change_pct < 0:
             trend = "هبوط"
@@ -446,54 +469,41 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
 
         return {
             "symbol": symbol,
-            "company_name": company_name,
-            "industry": industry,
-            "business_summary": summary[:200],
             "price": round(price, 4),
             "vwap": round(vwap, 4),
             "day_change_pct": round(day_change_pct, 2),
             "minute_change_pct": round(minute_change_pct, 2),
-            "last_min_vol": last_min_vol,
+            "last_1m_vol": last_1m_vol,
             "day_volume": day_volume,
-            "avg_vol20": avg_vol20,
-            "rvol": round(rvol, 2),
+            "rvol": round(rvol_1m, 2),
             "liquidity_power": round(liquidity_power, 2),
-            "last_min_dollar_vol": round(last_min_dollar_vol, 2),
+            "last_1m_dollar_vol": round(last_1m_dollar_vol, 2),
             "shares_outstanding": shares_outstanding,
             "float_shares": float_shares,
-            "market_cap": market_cap,
             "momentum": momentum,
             "whale": whale,
             "trend": trend,
             "entry": entry,
             "trigger": trigger,
             "sharia": sharia,
+            "business_ar": business_arabic(info),
         }
     except Exception:
         return None
 
 
 def is_candidate(metrics: dict) -> bool:
-    price = metrics["price"]
-    day_change = metrics["day_change_pct"]
-    rvol = metrics["rvol"]
-    day_vol = metrics["day_volume"]
-    last_min_dollar_vol = metrics["last_min_dollar_vol"]
-
-    if not (MIN_PRICE <= price <= MAX_PRICE):
+    if not (MIN_PRICE <= metrics["price"] <= MAX_PRICE):
         return False
 
-    if day_vol < MIN_DAY_VOLUME:
+    if metrics["day_volume"] < MIN_DAY_VOLUME:
         return False
 
-    if (
-        day_change >= MIN_DAY_CHANGE_PCT
-        or rvol >= MIN_RVOL
-        or last_min_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL
-    ):
-        return True
-
-    return False
+    return (
+        metrics["day_change_pct"] >= MIN_DAY_CHANGE_PCT
+        or metrics["rvol"] >= MIN_RVOL
+        or metrics["last_1m_dollar_vol"] >= MIN_LAST_MIN_DOLLAR_VOL
+    )
 
 
 def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
@@ -501,7 +511,7 @@ def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
     score += max(0, metrics["day_change_pct"]) * 2.0
     score += max(0, metrics["rvol"]) * 8.0
     score += min(metrics["liquidity_power"], 10) * 6.0
-    score += min(metrics["last_min_dollar_vol"] / 10000.0, 20) * 2.5
+    score += min(metrics["last_1m_dollar_vol"] / 10000.0, 20) * 2.5
 
     if metrics["trend"] == "صعود":
         score += 12
@@ -515,49 +525,91 @@ def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
     return round(score, 2)
 
 
-def build_alert_text(metrics: dict, is_gainer: bool, is_active: bool, news_title: str) -> str:
-    labels = []
-    if is_gainer:
-        labels.append("📈 الأكثر ارتفاعًا")
-    if is_active:
-        labels.append("⚡ الأكثر تداولًا")
-    if metrics["momentum"] in {"عالي", "عالي جدًا"}:
-        labels.append("🔥 زخم قوي")
-    if metrics["whale"] != "لا":
-        labels.append("🐳 دخول حوت")
-    if metrics["trend"] == "انتظار":
-        labels.append("⏳ انتظار")
-    elif metrics["trend"] == "هبوط":
-        labels.append("📉 هبوط")
+def get_repeat_number(symbol: str, current_price: float) -> int | None:
+    """
+    أول تنبيه = 1
+    يعيد التنبيه فقط إذا السعر ارتفع عن آخر تنبيه بنسبة محددة
+    """
+    meta = last_alert_meta.get(symbol)
+
+    if meta is None:
+        return 1
+
+    old_price = safe_float(meta.get("price"), 0.0)
+    old_count = safe_int(meta.get("count"), 1)
+
+    if old_price <= 0:
+        return old_count + 1
+
+    price_change_pct = ((current_price - old_price) / old_price) * 100
+
+    if price_change_pct >= REPEAT_ALERT_MIN_PRICE_PCT:
+        return old_count + 1
+
+    return None
+
+
+def mark_repeat_alert(symbol: str, current_price: float, repeat_number: int):
+    last_alert_meta[symbol] = {
+        "price": current_price,
+        "count": repeat_number,
+        "time": datetime.now(timezone.utc),
+    }
+
+
+def build_alert_text(metrics: dict, is_gainer: bool, is_active: bool, news_title: str, repeat_number: int) -> str:
+    tags = []
+
+    if repeat_number == 1:
+        tags.append("🚨 تنبيه 1")
     else:
-        labels.append("✅ صعود")
+        tags.append(f"🚨 تنبيه {repeat_number}")
 
-    labels_line = " | ".join(labels) if labels else "📊 مراقبة"
+    if repeat_number >= 2:
+        tags.append(f"📈 صعود {repeat_number}")
 
-    return (
-        f"{labels_line}\n\n"
-        f"السهم: {metrics['symbol']}\n"
-        f"الجلسة: {get_session_label()}\n"
-        f"السعر: {metrics['price']}\n"
-        f"الحالة: {metrics['trend']}\n"
-        f"القرار: {metrics['entry']}\n\n"
-        f"1- الزخم: {metrics['momentum']}\n"
-        f"2- عدد أسهم الشركة: {fmt_num(metrics['shares_outstanding'])}\n"
-        f"3- عدد الأسهم المطروحة: {fmt_num(metrics['float_shares'])}\n"
-        f"4- عدد الأسهم المتداولة: {fmt_num(metrics['day_volume'])}\n"
-        f"5- حجم التداول الآن: {fmt_num(metrics['day_volume'])}\n"
-        f"6- التغير اليومي: {pct_str(metrics['day_change_pct'])}\n"
-        f"7- قوة السيولة: {metrics['liquidity_power']}x\n"
-        f"8- سيولة آخر دقيقة: {fmt_num(metrics['last_min_vol'])}\n"
-        f"9- RVOL: {metrics['rvol']}\n"
-        f"10- الشرعية: {metrics['sharia']}\n"
-        f"11- مناسب للدخول: {metrics['entry']}\n"
-        f"12- دخول حوت: {metrics['whale']}\n"
-        f"13- عمل الشركة: {metrics['industry']}\n"
-        f"14- الخبر: {news_title if news_title else 'لا يوجد خبر'}\n"
-        f"15- الاتجاه: {metrics['trend']}\n\n"
-        f"VWAP: {metrics['vwap']}\n"
-    )
+    if is_gainer:
+        tags.append("🔥 الأكثر ارتفاعًا")
+    if is_active:
+        tags.append("⚡ الأكثر تداولًا")
+    if metrics["momentum"] in {"عالي", "عالي جدًا"}:
+        tags.append("💥 زخم")
+    if metrics["whale"] != "لا":
+        tags.append("🐳 سيولة")
+    if metrics["trend"] == "صعود":
+        tags.append("✅ صعود")
+    elif metrics["trend"] == "هبوط":
+        tags.append("📉 هبوط")
+    else:
+        tags.append("⏳ انتظار")
+
+    tags_line = " | ".join(tags)
+
+    lines = [
+        tags_line,
+        "",
+        f"السهم: {metrics['symbol']}",
+        f"الجلسة: {get_session_label()}",
+        f"السعر: {metrics['price']}",
+        f"التغير اليومي: {pct_str(metrics['day_change_pct'])}",
+        f"القرار: {metrics['entry']}",
+        "",
+        f"1- الزخم: {metrics['momentum']}",
+        f"2- عدد أسهم الشركة: {fmt_num(metrics['shares_outstanding'])}",
+        f"3- الأسهم المطروحة: {fmt_num(metrics['float_shares'])}",
+        f"4- حجم التداول اليوم: {fmt_num(metrics['day_volume'])}",
+        f"5- سيولة آخر دقيقة: {fmt_num(metrics['last_1m_vol'])}",
+        f"6- قوة السيولة: {metrics['liquidity_power']}x",
+        f"7- RVOL: {metrics['rvol']}",
+        f"8- الشرعية: {metrics['sharia']}",
+        f"9- دخول حوت: {metrics['whale']}",
+        f"10- عمل الشركة: {metrics['business_ar']}",
+        f"11- الخبر: {news_title if news_title else 'لا يوجد خبر'}",
+        f"12- الاتجاه: {metrics['trend']}",
+        f"13- VWAP: {metrics['vwap']}",
+    ]
+
+    return "\n".join(lines)
 
 
 # =========================
@@ -615,7 +667,10 @@ def scan_once():
             break
 
         symbol = item["symbol"]
-        if not can_send_alert(symbol):
+        current_price = safe_float(item["metrics"]["price"], 0.0)
+
+        repeat_number = get_repeat_number(symbol, current_price)
+        if repeat_number is None:
             continue
 
         news_title = get_news_headline(symbol)
@@ -623,13 +678,14 @@ def scan_once():
             item["metrics"],
             item["is_gainer"],
             item["is_active"],
-            news_title
+            news_title,
+            repeat_number
         )
 
         if send_telegram_message(text):
-            mark_alert_sent(symbol)
+            mark_repeat_alert(symbol, current_price, repeat_number)
             sent_count += 1
-            logging.info("Alert sent for %s", symbol)
+            logging.info("Alert sent for %s | repeat=%s", symbol, repeat_number)
 
     if sent_count == 0:
         logging.info("No alerts sent this round.")
@@ -643,7 +699,8 @@ def main():
     startup = (
         "✅ البوت اشتغل وبدأ فحص السوق الأمريكي\n"
         "يشمل: Top Gainers + Most Active + Fallback\n"
-        f"نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}"
+        f"نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}\n"
+        f"التنبيه يتكرر فقط إذا واصل السهم الصعود"
     )
     send_telegram_message(startup)
 
