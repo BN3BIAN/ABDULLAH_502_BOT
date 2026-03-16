@@ -280,6 +280,10 @@ def scan_once():
     ranked = []
     for symbol in SYMBOLS:
         metrics = fetch_symbol_metrics(symbol)
+
+        # تأخير بسيط لتخفيف الضغط على yfinance وتجنب Rate Limit
+        time.sleep(0.8)
+
         if metrics:
             ranked.append(metrics)
             logging.info(
