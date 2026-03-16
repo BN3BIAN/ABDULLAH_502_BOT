@@ -20,22 +20,22 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.20"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
 MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "150"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "3"))
+TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "5"))
 
-MIN_RVOL = float(os.getenv("MIN_RVOL", "0.8"))
-MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "1.0"))
-MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "5000"))
-MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "10000"))
+MIN_RVOL = float(os.getenv("MIN_RVOL", "0.3"))
+MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "0.3"))
+MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "1000"))
+MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "1000"))
 
 # إعادة التنبيه فقط إذا تحسن فعلي
-REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "1.0"))
-REPEAT_ALERT_MIN_RVOL_DELTA = float(os.getenv("REPEAT_ALERT_MIN_RVOL_DELTA", "0.5"))
-REPEAT_ALERT_MIN_VOL_DELTA_PCT = float(os.getenv("REPEAT_ALERT_MIN_VOL_DELTA_PCT", "30"))
+REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "0.5"))
+REPEAT_ALERT_MIN_RVOL_DELTA = float(os.getenv("REPEAT_ALERT_MIN_RVOL_DELTA", "0.2"))
+REPEAT_ALERT_MIN_VOL_DELTA_PCT = float(os.getenv("REPEAT_ALERT_MIN_VOL_DELTA_PCT", "10"))
 
 # كشف مبكر قبل الانفجار
-EARLY_BREAKOUT_DISTANCE_PCT = float(os.getenv("EARLY_BREAKOUT_DISTANCE_PCT", "1.2"))
-EARLY_MIN_RVOL = float(os.getenv("EARLY_MIN_RVOL", "0.9"))
-EARLY_MIN_DAY_CHANGE_PCT = float(os.getenv("EARLY_MIN_DAY_CHANGE_PCT", "0.5"))
+EARLY_BREAKOUT_DISTANCE_PCT = float(os.getenv("EARLY_BREAKOUT_DISTANCE_PCT", "2.0"))
+EARLY_MIN_RVOL = float(os.getenv("EARLY_MIN_RVOL", "0.5"))
+EARLY_MIN_DAY_CHANGE_PCT = float(os.getenv("EARLY_MIN_DAY_CHANGE_PCT", "0.3"))
 
 HALAL_SYMBOLS = {x.strip().upper() for x in os.getenv("HALAL_SYMBOLS", "").split(",") if x.strip()}
 HARAM_SYMBOLS = {x.strip().upper() for x in os.getenv("HARAM_SYMBOLS", "").split(",") if x.strip()}
@@ -57,6 +57,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+# تخزين آخر تنبيه لكل سهم
 last_alert_meta = {}
 
 
@@ -457,7 +458,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         else:
             entry = "انتظار"
 
-        # نوع الفرصة
         if price <= 5 and rvol_1m >= 1.0 and last_1m_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
             setup_type = "سكالب"
         elif trend == "صعود" and momentum in {"عالي", "عالي جدًا"} and price > 3:
@@ -485,10 +485,10 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
             "day_change_pct": round(day_change_pct, 2),
             "minute_change_pct": round(minute_change_pct, 2),
             "last_1m_vol": last_1m_vol,
+            "last_1m_dollar_vol": round(last_1m_dollar_vol, 2),
             "day_volume": day_volume,
             "rvol": round(rvol_1m, 2),
             "liquidity_power": round(liquidity_power, 2),
-            "last_1m_dollar_vol": round(last_1m_dollar_vol, 2),
             "shares_outstanding": shares_outstanding,
             "float_shares": float_shares,
             "momentum": momentum,
@@ -505,27 +505,41 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         return None
 
 
+# =========================
+# فلترة السهم
+# =========================
 def is_candidate(metrics: dict) -> bool:
-    if not (MIN_PRICE <= metrics["price"] <= MAX_PRICE):
+    price = safe_float(metrics.get("price", 0), 0)
+    day_change = safe_float(metrics.get("day_change_pct", 0), 0)
+    rvol = safe_float(metrics.get("rvol", 0), 0)
+    last_1m_dollar_vol = safe_float(metrics.get("last_1m_dollar_vol", 0), 0)
+    trend = metrics.get("trend", "")
+    setup_type = metrics.get("setup_type", "")
+
+    if not (MIN_PRICE <= price <= MAX_PRICE):
         return False
 
-    if metrics["day_volume"] < MIN_DAY_VOLUME:
+    if safe_int(metrics.get("day_volume", 0), 0) < MIN_DAY_VOLUME:
         return False
 
     rules_hit = 0
 
-    if metrics["day_change_pct"] >= MIN_DAY_CHANGE_PCT:
-        rules_hit += 1
-    if metrics["rvol"] >= MIN_RVOL:
-        rules_hit += 1
-    if metrics["last_1m_dollar_vol"] >= MIN_LAST_MIN_DOLLAR_VOL:
-        rules_hit += 1
-    if metrics["trend"] == "صعود":
-        rules_hit += 1
-    if metrics["setup_type"] == "قبل الانفجار":
+    if day_change >= MIN_DAY_CHANGE_PCT:
         rules_hit += 1
 
-    return rules_hit >= 2
+    if rvol >= MIN_RVOL:
+        rules_hit += 1
+
+    if last_1m_dollar_vol >= MIN_LAST_MIN_DOLLAR_VOL:
+        rules_hit += 1
+
+    if trend == "صعود":
+        rules_hit += 1
+
+    if setup_type in {"سكالب", "مومنتم", "قبل الانفجار"}:
+        rules_hit += 1
+
+    return rules_hit >= 1
 
 
 def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
@@ -630,63 +644,66 @@ def mark_repeat_alert(symbol: str, metrics: dict, news_title: str, repeat_number
 # بناء التنبيه
 # =========================
 def build_alert_text(metrics: dict, is_gainer: bool, is_active: bool, news_title: str, repeat_number: int) -> str:
-    top_line = []
+    badges = []
 
     if repeat_number == 1:
-        top_line.append("🚨 تنبيه 1")
+        badges.append("🚨 تنبيه 1")
     else:
-        top_line.append(f"🚨 تنبيه {repeat_number}")
-        top_line.append(f"📈 صعود {repeat_number}")
+        badges.append(f"🚨 تنبيه {repeat_number}")
+        badges.append(f"📈 صعود {repeat_number}")
 
-    if metrics["setup_type"] == "سكالب":
-        top_line.append("⚡ سكالب")
-    elif metrics["setup_type"] == "مومنتم":
-        top_line.append("🚀 مومنتم")
-    elif metrics["setup_type"] == "قبل الانفجار":
-        top_line.append("💥 قبل الانفجار")
+    setup_type = metrics.get("setup_type", "مراقبة")
+    if setup_type == "سكالب":
+        badges.append("⚡ سكالب")
+    elif setup_type == "مومنتم":
+        badges.append("🚀 مومنتم")
+    elif setup_type == "قبل الانفجار":
+        badges.append("💥 قبل الانفجار")
     else:
-        top_line.append("👀 مراقبة")
+        badges.append("👀 مراقبة")
 
     if is_gainer:
-        top_line.append("🔥 الأكثر ارتفاعًا")
+        badges.append("🔥 الأكثر ارتفاعًا")
     if is_active:
-        top_line.append("⚡ الأكثر تداولًا")
-    if metrics["whale"] != "لا":
-        top_line.append("🐳 سيولة قوية")
-    if metrics["trend"] == "صعود":
-        top_line.append("✅ ترند صاعد")
-    elif metrics["trend"] == "هبوط":
-        top_line.append("📉 هابط")
-    else:
-        top_line.append("⏳ انتظار")
+        badges.append("📊 الأكثر تداولًا")
 
-    top = " | ".join(top_line)
+    whale = metrics.get("whale", "لا")
+    if whale != "لا":
+        badges.append("🐳 سيولة قوية")
+
+    trend = metrics.get("trend", "انتظار")
+    if trend == "صعود":
+        badges.append("✅ صعود")
+    elif trend == "هبوط":
+        badges.append("📉 هبوط")
+    else:
+        badges.append("⏳ انتظار")
 
     return "\n".join([
-        top,
+        " | ".join(badges),
         "",
-        f"📈 السهم: {metrics['symbol']}",
+        f"📈 السهم: {metrics.get('symbol', '-')}",
         f"🕒 الجلسة: {get_session_label()}",
-        f"💰 السعر: {metrics['price']}",
-        f"📊 التغير اليومي: {pct_str(metrics['day_change_pct'])}",
-        f"🎯 القرار: {metrics['entry']}",
+        f"💰 السعر: {metrics.get('price', '-')}",
+        f"📊 التغير اليومي: {pct_str(metrics.get('day_change_pct', 0))}",
+        f"🎯 القرار: {metrics.get('entry', 'انتظار')}",
         "",
-        f"⚡ نوع الفرصة: {metrics['setup_type']}",
-        f"🔥 الزخم: {metrics['momentum']}",
-        f"🏢 أسهم الشركة: {fmt_num(metrics['shares_outstanding'])}",
-        f"📦 الأسهم المطروحة: {fmt_num(metrics['float_shares'])}",
-        f"🔁 حجم التداول اليوم: {fmt_num(metrics['day_volume'])}",
-        f"💧 سيولة آخر دقيقة: {fmt_num(metrics['last_1m_vol'])}",
-        f"📏 RVOL: {metrics['rvol']}",
-        f"💦 قوة السيولة: {metrics['liquidity_power']}x",
-        f"🕌 الشرعية: {metrics['sharia']}",
-        f"🐳 دخول حوت: {metrics['whale']}",
-        f"🏭 عمل الشركة: {metrics['business_ar']}",
+        f"⚡ نوع الفرصة: {setup_type}",
+        f"🔥 الزخم: {metrics.get('momentum', '-')}",
+        f"🏢 أسهم الشركة: {fmt_num(metrics.get('shares_outstanding', 0))}",
+        f"📦 الأسهم المطروحة: {fmt_num(metrics.get('float_shares', 0))}",
+        f"🔁 حجم التداول اليوم: {fmt_num(metrics.get('day_volume', 0))}",
+        f"💧 سيولة آخر دقيقة: {fmt_num(metrics.get('last_1m_vol', 0))}",
+        f"📏 RVOL: {metrics.get('rvol', 0)}",
+        f"💦 قوة السيولة: {metrics.get('liquidity_power', 0)}x",
+        f"🕌 الشرعية: {metrics.get('sharia', 'غير محدد')}",
+        f"🐳 دخول حوت: {whale}",
+        f"🏭 عمل الشركة: {metrics.get('business_ar', 'غير متوفر')}",
         f"📰 الخبر: {news_title if news_title else 'لا يوجد خبر'}",
-        f"📍 الاتجاه: {metrics['trend']}",
-        f"📌 VWAP: {metrics['vwap']}",
-        f"🎯 مسافة الاختراق: {metrics['breakout_distance_pct']}%",
-        f"🚪 اختراق عند: {metrics['trigger']}",
+        f"📍 الاتجاه: {trend}",
+        f"📌 VWAP: {metrics.get('vwap', 0)}",
+        f"🎯 مسافة الاختراق: {metrics.get('breakout_distance_pct', 0)}%",
+        f"🚪 الاختراق عند: {metrics.get('trigger', '-')}",
     ])
 
 
@@ -729,10 +746,10 @@ def scan_once():
                 "%s | score=%s | type=%s | change=%s | rvol=%s | trend=%s",
                 symbol,
                 score,
-                metrics["setup_type"],
-                metrics["day_change_pct"],
-                metrics["rvol"],
-                metrics["trend"]
+                metrics.get("setup_type"),
+                metrics.get("day_change_pct"),
+                metrics.get("rvol"),
+                metrics.get("trend")
             )
 
         except Exception as e:
@@ -741,16 +758,26 @@ def scan_once():
     ranked.sort(key=lambda x: x["score"], reverse=True)
 
     sent_count = 0
+    seen_symbols_this_round = set()
+
     for item in ranked:
         if sent_count >= TOP_ALERTS_PER_SCAN:
             break
 
         symbol = item["symbol"]
-        news_title = get_news_headline(symbol)
 
-        repeat_number = get_repeat_number(symbol, item["metrics"], news_title)
-        if repeat_number is None:
+        if symbol in seen_symbols_this_round:
             continue
+
+        news_title = get_news_headline(symbol)
+        repeat_number = get_repeat_number(symbol, item["metrics"], news_title)
+
+        if repeat_number is None:
+            old_meta = last_alert_meta.get(symbol)
+            if old_meta is None:
+                repeat_number = 1
+            else:
+                continue
 
         text = build_alert_text(
             item["metrics"],
@@ -763,6 +790,7 @@ def scan_once():
         if send_telegram_message(text):
             mark_repeat_alert(symbol, item["metrics"], news_title, repeat_number)
             sent_count += 1
+            seen_symbols_this_round.add(symbol)
             logging.info("Alert sent for %s | repeat=%s", symbol, repeat_number)
 
     if sent_count == 0:
