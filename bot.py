@@ -200,7 +200,21 @@ def fetch_symbol_metrics(symbol: str):
         vwap_series = tpv.cumsum() / vol_cum
         vwap = safe_float(vwap_series.iloc[-1], 0)
 
-        avg_vol20_series = df["Volume"].replace(0, pd.NA).rolling(20, min_periods=1).mean()
+       # تنظيف عمود الفوليوم
+try:
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+except:
+    return None
+
+# إزالة القيم الفارغة
+df = df.dropna(subset=["Volume"])
+
+if df.empty:
+    return None
+
+# حساب متوسط الفوليوم
+avg_vol20_series = df["Volume"].rolling(20, min_periods=1).mean()
+avg_vol20 = safe_float(avg_vol20_series.iloc[-1], 0)
         avg_vol20 = safe_float(avg_vol20_series.iloc[-1], 0)
         rvol = (last_1m_vol / avg_vol20) if avg_vol20 > 0 else 0.0
 
