@@ -1,4 +1,3 @@
-
 import os
 import re
 import time
@@ -24,20 +23,15 @@ MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "80"))
 TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "5"))
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 
-# فلترة مرنة للبيني ستوك
 MIN_RVOL = float(os.getenv("MIN_RVOL", "1.2"))
 MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "3.0"))
 MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "15000"))
 MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "50000"))
 
-# لو أردت تحديد الشرعية يدويًا:
-# HALAL_SYMBOLS=DXST,ASNS
-# HARAM_SYMBOLS=ABC,XYZ
 HALAL_SYMBOLS = {x.strip().upper() for x in os.getenv("HALAL_SYMBOLS", "").split(",") if x.strip()}
 HARAM_SYMBOLS = {x.strip().upper() for x in os.getenv("HARAM_SYMBOLS", "").split(",") if x.strip()}
 
-# إن احتجت مفتاح أخبار لاحقًا، اتركه الآن فارغ
-NEWS_API_KEY = os.getenv("NEWS_API_KEY", "").strip()
+FMP_API_KEY = os.getenv("FMP_API_KEY", "demo").strip()
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
@@ -105,8 +99,6 @@ def safe_int(x, default=0):
 
 
 def get_session_label() -> str:
-    # حساب تقريبي بناءً على UTC -> ET
-    # ليس شرطًا في الفلترة، فقط للعرض
     try:
         from zoneinfo import ZoneInfo
         now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -158,8 +150,27 @@ def send_telegram_message(text: str) -> bool:
 
 
 # =========================
-# جلب قوائم Gainers / Most Active
+# جلب المرشحين
 # =========================
+def _clean_symbol_list(symbols):
+    clean = []
+    seen = set()
+
+    for s in symbols:
+        if not s:
+            continue
+        s = str(s).strip().upper()
+
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s):
+            continue
+
+        if s not in seen:
+            seen.add(s)
+            clean.append(s)
+
+    return clean
+
+
 def _extract_symbols_from_table(df: pd.DataFrame) -> list[str]:
     candidates = []
     possible_cols = [c for c in df.columns if str(c).strip().lower() in {"symbol", "ticker"}]
@@ -178,6 +189,48 @@ def _extract_symbols_from_table(df: pd.DataFrame) -> list[str]:
             candidates.append(v.strip().upper())
 
     return candidates
+
+
+def fetch_fmp_candidates() -> tuple[list[str], set[str], set[str]]:
+    gainers_url = f"https://financialmodelingprep.com/api/v3/stock_market/gainers?apikey={FMP_API_KEY}"
+    actives_url = f"https://financialmodelingprep.com/api/v3/stock_market/actives?apikey={FMP_API_KEY}"
+
+    gainers = []
+    actives = []
+
+    try:
+        r = requests.get(gainers_url, headers=HEADERS, timeout=20)
+        data = r.json() if r.ok else []
+        if isinstance(data, list):
+            for item in data:
+                symbol = item.get("symbol")
+                if symbol:
+                    gainers.append(symbol)
+    except Exception as e:
+        logging.warning("FMP gainers fetch failed: %s", e)
+
+    try:
+        r = requests.get(actives_url, headers=HEADERS, timeout=20)
+        data = r.json() if r.ok else []
+        if isinstance(data, list):
+            for item in data:
+                symbol = item.get("symbol")
+                if symbol:
+                    actives.append(symbol)
+    except Exception as e:
+        logging.warning("FMP actives fetch failed: %s", e)
+
+    gainers = _clean_symbol_list(gainers)
+    actives = _clean_symbol_list(actives)
+
+    ordered = []
+    seen = set()
+    for s in gainers + actives:
+        if s not in seen:
+            seen.add(s)
+            ordered.append(s)
+
+    return ordered[:MAX_CANDIDATES], set(gainers), set(actives)
 
 
 def fetch_yahoo_candidates() -> tuple[list[str], set[str], set[str]]:
@@ -199,32 +252,28 @@ def fetch_yahoo_candidates() -> tuple[list[str], set[str], set[str]]:
 
     for kind, url_list in urls.items():
         collected = []
+
         for url in url_list:
             try:
                 tables = pd.read_html(url)
                 for df in tables:
                     syms = _extract_symbols_from_table(df)
                     collected.extend(syms)
+
                 if collected:
                     break
             except Exception:
                 continue
 
-        clean = []
-        seen = set()
-        for s in collected:
-            if s not in seen:
-                seen.add(s)
-                clean.append(s)
+        collected = _clean_symbol_list(collected)
 
         if kind == "gainers":
-            gainers_set.update(clean)
+            gainers_set.update(collected)
         else:
-            active_set.update(clean)
+            active_set.update(collected)
 
-        all_symbols.extend(clean)
+        all_symbols.extend(collected)
 
-    # إزالة التكرار مع الحفاظ على الترتيب
     ordered = []
     seen = set()
     for s in all_symbols:
@@ -232,7 +281,13 @@ def fetch_yahoo_candidates() -> tuple[list[str], set[str], set[str]]:
             seen.add(s)
             ordered.append(s)
 
-    return ordered[:MAX_CANDIDATES], gainers_set, active_set
+    ordered = ordered[:MAX_CANDIDATES]
+
+    if not ordered:
+        logging.info("Yahoo returned 0 candidates, switching to FMP fallback...")
+        return fetch_fmp_candidates()
+
+    return ordered, gainers_set, active_set
 
 
 # =========================
@@ -314,7 +369,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         rvol = safe_float(latest["RVOL"])
         minute_change_pct = ((price - safe_float(prev["Close"])) / safe_float(prev["Close"], 1)) * 100
 
-        # افتتاح اليوم الحالي من أول بار موجود في البيانات
         today_open = safe_float(df.iloc[0]["Open"], price)
         day_change_pct = ((price - today_open) / (today_open if today_open else 1)) * 100
 
@@ -348,7 +402,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         else:
             whale = "لا"
 
-        # الحالة العامة
         if price > vwap and day_change_pct > 0 and rvol >= 1.3:
             trend = "صعود"
         elif price < vwap and day_change_pct < 0:
@@ -356,7 +409,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         else:
             trend = "انتظار"
 
-        # قرار تقريبي
         recent_high = safe_float(df["High"].tail(15).max(), price)
         trigger = round(recent_high + 0.01, 4)
 
@@ -367,7 +419,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         else:
             entry = "انتظار"
 
-        # شرعية يدوية فقط
         if symbol in HALAL_SYMBOLS:
             sharia = "شرعي"
         elif symbol in HARAM_SYMBOLS:
@@ -414,7 +465,6 @@ def is_candidate(metrics: dict) -> bool:
     if not (MIN_PRICE <= price <= MAX_PRICE):
         return False
 
-    # فلترة مرنة تناسب البيني ستوك والسكالب
     if day_vol < MIN_DAY_VOLUME:
         return False
 
