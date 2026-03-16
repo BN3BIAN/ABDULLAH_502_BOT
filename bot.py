@@ -16,28 +16,28 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "180"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
 TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "4"))
 
-MARKET_SYMBOL_LIMIT = int(os.getenv("MARKET_SYMBOL_LIMIT", "80"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.6"))
+MARKET_SYMBOL_LIMIT = int(os.getenv("MARKET_SYMBOL_LIMIT", "60"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "30"))
 
 # دخول سريع
-FAST_MIN_DAY_CHANGE = float(os.getenv("FAST_MIN_DAY_CHANGE", "5.0"))
-FAST_MIN_MINUTE_CHANGE = float(os.getenv("FAST_MIN_MINUTE_CHANGE", "0.50"))
-FAST_MIN_RVOL = float(os.getenv("FAST_MIN_RVOL", "2.0"))
+FAST_MIN_DAY_CHANGE = float(os.getenv("FAST_MIN_DAY_CHANGE", "3.5"))
+FAST_MIN_MINUTE_CHANGE = float(os.getenv("FAST_MIN_MINUTE_CHANGE", "0.25"))
+FAST_MIN_RVOL = float(os.getenv("FAST_MIN_RVOL", "1.3"))
 
 # ترند اليوم
-TREND_MIN_DAY_CHANGE = float(os.getenv("TREND_MIN_DAY_CHANGE", "8.0"))
-TREND_MIN_MINUTE_CHANGE = float(os.getenv("TREND_MIN_MINUTE_CHANGE", "0.12"))
-TREND_MIN_RVOL = float(os.getenv("TREND_MIN_RVOL", "1.3"))
+TREND_MIN_DAY_CHANGE = float(os.getenv("TREND_MIN_DAY_CHANGE", "5.0"))
+TREND_MIN_MINUTE_CHANGE = float(os.getenv("TREND_MIN_MINUTE_CHANGE", "0.05"))
+TREND_MIN_RVOL = float(os.getenv("TREND_MIN_RVOL", "1.0"))
 
 # فلتر إضافي
-MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "15000"))
-MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "300000"))
+MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "5000"))
+MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "100000"))
 
 FINNHUB_URL = "https://finnhub.io/api/v1"
 
@@ -64,10 +64,6 @@ def normalize_symbols(raw: str):
 
 
 def parse_float_map(raw: str):
-    """
-    مثال:
-    FLOAT_SHARES_MAP=TSLA:2800000000,NVDA:24600000000,PLTR:1900000000
-    """
     result = {}
     if not raw:
         return result
@@ -228,8 +224,8 @@ def get_market_symbols():
             if "." in symbol or "^" in symbol:
                 continue
 
-            # نركز على الأسهم العادية
-            if typ and typ not in {"COMMON STOCK", "ADR", "ETP", "ETF"}:
+            # نركز فقط على الأسهم العادية و ADR
+            if typ and typ not in {"COMMON STOCK", "ADR"}:
                 continue
 
             symbols.append(symbol)
@@ -535,6 +531,10 @@ def scan_once():
         if last_1m_vol < MIN_LAST_1M_VOL:
             continue
         if day_volume < MIN_DAY_VOLUME:
+            continue
+
+        # يمنع الأسهم الرخيصة الضعيفة إلا لو الزخم قوي جدًا
+        if price < 1 and day_change_pct < 8:
             continue
 
         signal_type = classify_signal(day_change_pct, minute_change_pct, rvol, above_vwap)
