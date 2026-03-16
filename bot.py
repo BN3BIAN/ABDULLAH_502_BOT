@@ -59,11 +59,11 @@ def fmt_num(n) -> str:
         return "0"
 
     if n >= 1_000_000_000:
-        return f"{n/1_000_000_000:.2f}".rstrip("0").rstrip(".") + "B"
+        return f"{n / 1_000_000_000:.2f}".rstrip("0").rstrip(".") + "B"
     if n >= 1_000_000:
-        return f"{n/1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+        return f"{n / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
     if n >= 1_000:
-        return f"{n/1_000:.2f}".rstrip("0").rstrip(".") + "K"
+        return f"{n / 1_000:.2f}".rstrip("0").rstrip(".") + "K"
     if float(n).is_integer():
         return str(int(n))
     return f"{n:.2f}".rstrip("0").rstrip(".")
@@ -136,7 +136,7 @@ def get_repeat_count(symbol: str) -> int:
     return safe_int(last_sent.get(symbol, {}).get("count"), 0) + 1
 
 
-def clean_downloaded_df(df: pd.DataFrame) -> pd.DataFrame | None:
+def clean_downloaded_df(df: pd.DataFrame):
     try:
         if df is None or df.empty:
             return None
@@ -180,41 +180,40 @@ def fetch_symbol_metrics(symbol: str):
             logging.info("%s | no clean data", symbol)
             return None
 
+        df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
+        df = df.dropna(subset=["Volume"]).copy()
+
+        if df.empty or len(df) < 2:
+            logging.info("%s | insufficient data after cleaning", symbol)
+            return None
+
         latest = df.iloc[-1]
-        prev = df.iloc[-2] if len(df) > 1 else latest
+        prev = df.iloc[-2]
 
         price = safe_float(latest["Close"])
         if not (MIN_PRICE <= price <= MAX_PRICE):
             return None
 
         day_open = safe_float(df.iloc[0]["Open"], price)
-        day_change_pct = ((price - day_open) / (day_open if day_open else 1)) * 100
-        minute_change_pct = ((price - safe_float(prev["Close"], price)) / (safe_float(prev["Close"], 1))) * 100
+        prev_close = safe_float(prev["Close"], price)
+
+        day_change_pct = ((price - day_open) / day_open) * 100 if day_open > 0 else 0.0
+        minute_change_pct = ((price - prev_close) / prev_close) * 100 if prev_close > 0 else 0.0
 
         day_volume = safe_int(df["Volume"].sum())
         last_1m_vol = safe_int(latest["Volume"])
 
         typical = (df["High"] + df["Low"] + df["Close"]) / 3.0
         tpv = typical * df["Volume"]
-        vol_cum = df["Volume"].replace(0, pd.NA).cumsum()
-        vwap_series = tpv.cumsum() / vol_cum
-        vwap = safe_float(vwap_series.iloc[-1], 0)
+        vol_cum = df["Volume"].cumsum()
 
-       # تنظيف عمود الفوليوم
-try:
-    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce")
-except:
-    return None
+        if vol_cum.empty or safe_float(vol_cum.iloc[-1], 0) <= 0:
+            vwap = 0.0
+        else:
+            vwap_series = tpv.cumsum() / vol_cum
+            vwap = safe_float(vwap_series.iloc[-1], 0)
 
-# إزالة القيم الفارغة
-df = df.dropna(subset=["Volume"])
-
-if df.empty:
-    return None
-
-# حساب متوسط الفوليوم
-avg_vol20_series = df["Volume"].rolling(20, min_periods=1).mean()
-avg_vol20 = safe_float(avg_vol20_series.iloc[-1], 0)
+        avg_vol20_series = df["Volume"].rolling(20, min_periods=1).mean()
         avg_vol20 = safe_float(avg_vol20_series.iloc[-1], 0)
         rvol = (last_1m_vol / avg_vol20) if avg_vol20 > 0 else 0.0
 
@@ -239,6 +238,7 @@ avg_vol20 = safe_float(avg_vol20_series.iloc[-1], 0)
             "trend": trend,
             "score": round(score, 2),
         }
+
     except Exception as e:
         logging.exception("fetch_symbol_metrics failed for %s: %s", symbol, e)
         return None
