@@ -9,35 +9,29 @@ import requests
 import pandas as pd
 
 
-# =========================
-# Environment Variables
-# =========================
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "4"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "5"))
 
-MARKET_SYMBOL_LIMIT = int(os.getenv("MARKET_SYMBOL_LIMIT", "60"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.8"))
+MARKET_SYMBOL_LIMIT = int(os.getenv("MARKET_SYMBOL_LIMIT", "25"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.35"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "30"))
 
-# دخول سريع
-FAST_MIN_DAY_CHANGE = float(os.getenv("FAST_MIN_DAY_CHANGE", "3.5"))
-FAST_MIN_MINUTE_CHANGE = float(os.getenv("FAST_MIN_MINUTE_CHANGE", "0.25"))
-FAST_MIN_RVOL = float(os.getenv("FAST_MIN_RVOL", "1.3"))
+FAST_MIN_DAY_CHANGE = float(os.getenv("FAST_MIN_DAY_CHANGE", "2.0"))
+FAST_MIN_MINUTE_CHANGE = float(os.getenv("FAST_MIN_MINUTE_CHANGE", "0.10"))
+FAST_MIN_RVOL = float(os.getenv("FAST_MIN_RVOL", "1.05"))
 
-# ترند اليوم
-TREND_MIN_DAY_CHANGE = float(os.getenv("TREND_MIN_DAY_CHANGE", "5.0"))
-TREND_MIN_MINUTE_CHANGE = float(os.getenv("TREND_MIN_MINUTE_CHANGE", "0.05"))
-TREND_MIN_RVOL = float(os.getenv("TREND_MIN_RVOL", "1.0"))
+TREND_MIN_DAY_CHANGE = float(os.getenv("TREND_MIN_DAY_CHANGE", "3.5"))
+TREND_MIN_MINUTE_CHANGE = float(os.getenv("TREND_MIN_MINUTE_CHANGE", "0.00"))
+TREND_MIN_RVOL = float(os.getenv("TREND_MIN_RVOL", "0.90"))
 
-# فلتر إضافي
-MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "5000"))
-MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "100000"))
+MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "1000"))
+MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "30000"))
 
 FINNHUB_URL = "https://finnhub.io/api/v1"
 
@@ -49,9 +43,6 @@ logging.basicConfig(
 last_sent = {}
 
 
-# =========================
-# Helpers
-# =========================
 def normalize_symbols(raw: str):
     if not raw:
         return set()
@@ -202,9 +193,6 @@ def mark_sent(symbol: str, price: float):
     last_sent[symbol] = {"price": price}
 
 
-# =========================
-# Finnhub API
-# =========================
 def get_market_symbols():
     url = f"{FINNHUB_URL}/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
 
@@ -223,8 +211,10 @@ def get_market_symbols():
                 continue
             if "." in symbol or "^" in symbol:
                 continue
-
-            # نركز فقط على الأسهم العادية و ADR
+            if not symbol.isalpha():
+                continue
+            if len(symbol) > 5:
+                continue
             if typ and typ not in {"COMMON STOCK", "ADR"}:
                 continue
 
@@ -245,6 +235,11 @@ def get_quote(symbol: str):
 
     try:
         r = requests.get(url, timeout=20)
+
+        if r.status_code == 403:
+            logging.info("%s | quote forbidden", symbol)
+            return None
+
         r.raise_for_status()
         data = r.json()
 
@@ -271,6 +266,16 @@ def get_profile(symbol: str):
 
     try:
         r = requests.get(url, timeout=20)
+
+        if r.status_code == 403:
+            logging.info("%s | profile forbidden", symbol)
+            return {
+                "name": "",
+                "market_cap_m": 0,
+                "shares_outstanding_m": 0,
+                "float_shares": FLOAT_SHARES_MAP.get(symbol.upper(), 0),
+            }
+
         r.raise_for_status()
         data = r.json()
 
@@ -310,6 +315,11 @@ def get_candles(symbol: str):
 
     try:
         r = requests.get(url, timeout=20)
+
+        if r.status_code == 403:
+            logging.info("%s | candle forbidden", symbol)
+            return None
+
         r.raise_for_status()
         data = r.json()
 
@@ -375,9 +385,6 @@ def get_candles(symbol: str):
         return None
 
 
-# =========================
-# Signal Logic
-# =========================
 def classify_signal(day_change_pct, minute_change_pct, rvol, above_vwap):
     if (
         day_change_pct >= FAST_MIN_DAY_CHANGE
@@ -494,9 +501,6 @@ def build_alert_text(m: dict) -> str:
     return "\n".join(lines)
 
 
-# =========================
-# Main Scan
-# =========================
 def scan_once():
     symbols = get_market_symbols()
     logging.info("Scanning %s symbols...", len(symbols))
@@ -532,8 +536,6 @@ def scan_once():
             continue
         if day_volume < MIN_DAY_VOLUME:
             continue
-
-        # يمنع الأسهم الرخيصة الضعيفة إلا لو الزخم قوي جدًا
         if price < 1 and day_change_pct < 8:
             continue
 
