@@ -17,18 +17,20 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.20"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "20"))
-MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "120"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "2"))
+MAX_CANDIDATES = int(os.getenv("MAX_CANDIDATES", "150"))
+TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "3"))
 
 MIN_RVOL = float(os.getenv("MIN_RVOL", "0.8"))
 MIN_DAY_CHANGE_PCT = float(os.getenv("MIN_DAY_CHANGE_PCT", "1.0"))
 MIN_LAST_MIN_DOLLAR_VOL = float(os.getenv("MIN_LAST_MIN_DOLLAR_VOL", "5000"))
 MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "10000"))
 
-# فرق الارتفاع المطلوب لإعادة تنبيه نفس السهم
-REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "0.8"))
+# شروط إعادة نفس السهم فقط إذا تحسن فعلاً
+REPEAT_ALERT_MIN_PRICE_PCT = float(os.getenv("REPEAT_ALERT_MIN_PRICE_PCT", "1.0"))
+REPEAT_ALERT_MIN_RVOL_DELTA = float(os.getenv("REPEAT_ALERT_MIN_RVOL_DELTA", "0.5"))
+REPEAT_ALERT_MIN_VOL_DELTA_PCT = float(os.getenv("REPEAT_ALERT_MIN_VOL_DELTA_PCT", "30"))
 
 HALAL_SYMBOLS = {x.strip().upper() for x in os.getenv("HALAL_SYMBOLS", "").split(",") if x.strip()}
 HARAM_SYMBOLS = {x.strip().upper() for x in os.getenv("HARAM_SYMBOLS", "").split(",") if x.strip()}
@@ -37,26 +39,33 @@ FMP_API_KEY = os.getenv("FMP_API_KEY", "demo").strip()
 
 FALLBACK_SYMBOLS = [
     "BBAI", "SOUN", "PLTR", "SOFI", "MARA", "RIOT", "LCID", "NIO",
-    "NKLA", "ACHR", "QBTS", "RGTI", "IONQ", "HIMS", "OPEN", "RUN",
+    "ACHR", "QBTS", "RGTI", "IONQ", "HIMS", "OPEN", "RUN",
     "FUBO", "ASTS", "DNA", "RXRX", "BMEA", "ALT", "TNXP", "SLS",
-    "HUSA", "UEC", "DNN", "AAPL", "TSLA", "AMD", "NVDA", "SMCI",
-    "INTC", "ABEV", "GRAB", "WULF", "CLS", "KULR", "SERV", "TELL"
+    "UEC", "DNN", "AAPL", "TSLA", "AMD", "NVDA", "SMCI",
+    "INTC", "ABEV", "GRAB", "WULF", "CLS", "KULR", "SERV"
 ]
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-# حفظ آخر تنبيه لكل سهم
+# تخزين آخر بصمة تنبيه لكل سهم
 last_alert_meta = {}
 # مثال:
 # {
-#   "MARA": {"price": 9.68, "count": 1, "time": datetime.utcnow()}
+#   "SLS": {
+#       "price": 5.41,
+#       "count": 1,
+#       "rvol": 1.2,
+#       "last_1m_vol": 120000,
+#       "trend": "انتظار",
+#       "trigger": 5.52,
+#       "news": "لا يوجد خبر",
+#       "time": "..."
+#   }
 # }
 
 
@@ -88,10 +97,9 @@ def fmt_num(n) -> str:
 
 def pct_str(x) -> str:
     try:
-        x = float(x)
+        return f"{float(x):+.2f}%"
     except Exception:
         return "0%"
-    return f"{x:+.2f}%"
 
 
 def safe_float(x, default=0.0):
@@ -151,7 +159,7 @@ def send_telegram_message(text: str) -> bool:
 
 
 # =========================
-# ترجمة عمل الشركة
+# ترجمة نشاط الشركة
 # =========================
 SECTOR_MAP = {
     "Technology": "تقنية",
@@ -161,24 +169,24 @@ SECTOR_MAP = {
     "Energy": "طاقة",
     "Consumer Cyclical": "استهلاكي دوري",
     "Consumer Defensive": "استهلاكي أساسي",
-    "Communication Services": "خدمات اتصالات",
+    "Communication Services": "اتصالات",
     "Basic Materials": "مواد أساسية",
     "Real Estate": "عقارات",
     "Utilities": "مرافق",
 }
 
 INDUSTRY_MAP = {
-    "Capital Markets": "أسواق مالية وخدمات استثمار",
-    "Biotechnology": "تقنية حيوية وتطوير أدوية",
-    "Semiconductors": "أشباه موصلات ورقائق إلكترونية",
-    "Software - Infrastructure": "برمجيات وبنية تحتية رقمية",
-    "Software - Application": "برمجيات وتطبيقات",
-    "Auto Manufacturers": "تصنيع سيارات",
-    "Solar": "طاقة شمسية",
+    "Capital Markets": "الاستثمار والأسواق المالية",
+    "Biotechnology": "التكنولوجيا الحيوية وتطوير الأدوية",
+    "Semiconductors": "الرقائق الإلكترونية وأشباه الموصلات",
+    "Software - Infrastructure": "البرمجيات والبنية التحتية الرقمية",
+    "Software - Application": "البرمجيات والتطبيقات",
+    "Auto Manufacturers": "تصنيع السيارات",
+    "Solar": "الطاقة الشمسية",
     "Oil & Gas E&P": "استكشاف وإنتاج النفط والغاز",
-    "Uranium": "يورانيوم وطاقة نووية",
-    "Medical Devices": "أجهزة ومستلزمات طبية",
-    "Drug Manufacturers - Specialty & Generic": "تصنيع أدوية متخصصة وعامة",
+    "Uranium": "اليورانيوم والطاقة النووية",
+    "Medical Devices": "الأجهزة الطبية",
+    "Drug Manufacturers - Specialty & Generic": "تصنيع الأدوية",
 }
 
 
@@ -399,7 +407,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         vol_cum = df["Volume"].replace(0, pd.NA).cumsum()
         df["VWAP"] = df["TPV"].cumsum() / vol_cum
 
-        # لحظي من نفس الدقيقة
         df["AvgVol20_1m"] = df["Volume"].replace(0, pd.NA).rolling(20).mean()
         df["RVOL_1m"] = df["Volume"] / df["AvgVol20_1m"]
 
@@ -408,7 +415,6 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
 
         price = safe_float(latest["Close"])
         vwap = safe_float(latest["VWAP"])
-
         last_1m_vol = safe_int(latest["Volume"])
         rvol_1m = safe_float(latest["RVOL_1m"])
         liquidity_power = rvol_1m if rvol_1m > 0 else 0.0
@@ -454,7 +460,7 @@ def compute_metrics(symbol: str, df: pd.DataFrame, info: dict) -> dict | None:
         trigger = round(recent_high + 0.01, 4)
 
         if trend == "صعود" and momentum in {"عالي", "عالي جدًا"}:
-            entry = "مناسب لدخول سريع بحذر"
+            entry = "دخول سريع بحذر"
         elif price < recent_high:
             entry = f"انتظار اختراق {trigger}"
         else:
@@ -499,11 +505,18 @@ def is_candidate(metrics: dict) -> bool:
     if metrics["day_volume"] < MIN_DAY_VOLUME:
         return False
 
-    return (
-        metrics["day_change_pct"] >= MIN_DAY_CHANGE_PCT
-        or metrics["rvol"] >= MIN_RVOL
-        or metrics["last_1m_dollar_vol"] >= MIN_LAST_MIN_DOLLAR_VOL
-    )
+    rules_hit = 0
+
+    if metrics["day_change_pct"] >= MIN_DAY_CHANGE_PCT:
+        rules_hit += 1
+    if metrics["rvol"] >= MIN_RVOL:
+        rules_hit += 1
+    if metrics["last_1m_dollar_vol"] >= MIN_LAST_MIN_DOLLAR_VOL:
+        rules_hit += 1
+    if metrics["trend"] == "صعود":
+        rules_hit += 1
+
+    return rules_hit >= 2
 
 
 def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
@@ -525,91 +538,127 @@ def score_stock(metrics: dict, is_gainer: bool, is_active: bool) -> float:
     return round(score, 2)
 
 
-def get_repeat_number(symbol: str, current_price: float) -> int | None:
+# =========================
+# منع التكرار المتطابق
+# =========================
+def get_repeat_number(symbol: str, metrics: dict, news_title: str) -> int | None:
     """
-    أول تنبيه = 1
-    يعيد التنبيه فقط إذا السعر ارتفع عن آخر تنبيه بنسبة محددة
+    أول مرة: 1
+    ثاني مرة أو أكثر: فقط إذا حصل تحسن حقيقي
     """
-    meta = last_alert_meta.get(symbol)
+    old = last_alert_meta.get(symbol)
+    current_price = safe_float(metrics["price"], 0.0)
+    current_rvol = safe_float(metrics["rvol"], 0.0)
+    current_vol = safe_int(metrics["last_1m_vol"], 0)
+    current_trend = metrics["trend"]
+    current_trigger = safe_float(metrics["trigger"], 0.0)
 
-    if meta is None:
+    if old is None:
         return 1
 
-    old_price = safe_float(meta.get("price"), 0.0)
-    old_count = safe_int(meta.get("count"), 1)
+    old_price = safe_float(old.get("price"), 0.0)
+    old_count = safe_int(old.get("count"), 1)
+    old_rvol = safe_float(old.get("rvol"), 0.0)
+    old_vol = safe_int(old.get("last_1m_vol"), 0)
+    old_trend = old.get("trend", "")
+    old_trigger = safe_float(old.get("trigger"), 0.0)
+    old_news = old.get("news", "")
 
-    if old_price <= 0:
-        return old_count + 1
+    improved = False
 
-    price_change_pct = ((current_price - old_price) / old_price) * 100
+    if old_price > 0:
+        price_change_pct = ((current_price - old_price) / old_price) * 100
+        if price_change_pct >= REPEAT_ALERT_MIN_PRICE_PCT:
+            improved = True
 
-    if price_change_pct >= REPEAT_ALERT_MIN_PRICE_PCT:
+    if (current_rvol - old_rvol) >= REPEAT_ALERT_MIN_RVOL_DELTA:
+        improved = True
+
+    if old_vol > 0:
+        vol_change_pct = ((current_vol - old_vol) / old_vol) * 100
+        if vol_change_pct >= REPEAT_ALERT_MIN_VOL_DELTA_PCT:
+            improved = True
+    elif current_vol > 0 and old_vol == 0:
+        improved = True
+
+    if current_trend != old_trend:
+        improved = True
+
+    if abs(current_trigger - old_trigger) >= 0.01:
+        improved = True
+
+    if news_title and news_title != "لا يوجد خبر" and news_title != old_news:
+        improved = True
+
+    if improved:
         return old_count + 1
 
     return None
 
 
-def mark_repeat_alert(symbol: str, current_price: float, repeat_number: int):
+def mark_repeat_alert(symbol: str, metrics: dict, news_title: str, repeat_number: int):
     last_alert_meta[symbol] = {
-        "price": current_price,
+        "price": safe_float(metrics["price"], 0.0),
         "count": repeat_number,
-        "time": datetime.now(timezone.utc),
+        "rvol": safe_float(metrics["rvol"], 0.0),
+        "last_1m_vol": safe_int(metrics["last_1m_vol"], 0),
+        "trend": metrics["trend"],
+        "trigger": safe_float(metrics["trigger"], 0.0),
+        "news": news_title,
+        "time": datetime.now(timezone.utc).isoformat(),
     }
 
 
+# =========================
+# بناء التنبيه
+# =========================
 def build_alert_text(metrics: dict, is_gainer: bool, is_active: bool, news_title: str, repeat_number: int) -> str:
-    tags = []
+    top_line = []
 
     if repeat_number == 1:
-        tags.append("🚨 تنبيه 1")
+        top_line.append("🚨 تنبيه 1")
     else:
-        tags.append(f"🚨 تنبيه {repeat_number}")
-
-    if repeat_number >= 2:
-        tags.append(f"📈 صعود {repeat_number}")
+        top_line.append(f"🚨 تنبيه {repeat_number}")
+        top_line.append(f"📈 صعود {repeat_number}")
 
     if is_gainer:
-        tags.append("🔥 الأكثر ارتفاعًا")
+        top_line.append("🔥 الأكثر ارتفاعًا")
     if is_active:
-        tags.append("⚡ الأكثر تداولًا")
-    if metrics["momentum"] in {"عالي", "عالي جدًا"}:
-        tags.append("💥 زخم")
+        top_line.append("⚡ الأكثر تداولًا")
     if metrics["whale"] != "لا":
-        tags.append("🐳 سيولة")
+        top_line.append("🐳 سيولة قوية")
     if metrics["trend"] == "صعود":
-        tags.append("✅ صعود")
+        top_line.append("✅ ترند صاعد")
     elif metrics["trend"] == "هبوط":
-        tags.append("📉 هبوط")
+        top_line.append("📉 هابط")
     else:
-        tags.append("⏳ انتظار")
+        top_line.append("⏳ انتظار")
 
-    tags_line = " | ".join(tags)
+    top = " | ".join(top_line)
 
-    lines = [
-        tags_line,
+    return "\n".join([
+        top,
         "",
-        f"السهم: {metrics['symbol']}",
-        f"الجلسة: {get_session_label()}",
-        f"السعر: {metrics['price']}",
-        f"التغير اليومي: {pct_str(metrics['day_change_pct'])}",
-        f"القرار: {metrics['entry']}",
+        f"📈 السهم: {metrics['symbol']}",
+        f"🕒 الجلسة: {get_session_label()}",
+        f"💰 السعر: {metrics['price']}",
+        f"📊 التغير اليومي: {pct_str(metrics['day_change_pct'])}",
+        f"🎯 القرار: {metrics['entry']}",
         "",
-        f"1- الزخم: {metrics['momentum']}",
-        f"2- عدد أسهم الشركة: {fmt_num(metrics['shares_outstanding'])}",
-        f"3- الأسهم المطروحة: {fmt_num(metrics['float_shares'])}",
-        f"4- حجم التداول اليوم: {fmt_num(metrics['day_volume'])}",
-        f"5- سيولة آخر دقيقة: {fmt_num(metrics['last_1m_vol'])}",
-        f"6- قوة السيولة: {metrics['liquidity_power']}x",
-        f"7- RVOL: {metrics['rvol']}",
-        f"8- الشرعية: {metrics['sharia']}",
-        f"9- دخول حوت: {metrics['whale']}",
-        f"10- عمل الشركة: {metrics['business_ar']}",
-        f"11- الخبر: {news_title if news_title else 'لا يوجد خبر'}",
-        f"12- الاتجاه: {metrics['trend']}",
-        f"13- VWAP: {metrics['vwap']}",
-    ]
-
-    return "\n".join(lines)
+        f"⚡ الزخم: {metrics['momentum']}",
+        f"🏢 أسهم الشركة: {fmt_num(metrics['shares_outstanding'])}",
+        f"📦 الأسهم المطروحة: {fmt_num(metrics['float_shares'])}",
+        f"🔁 حجم التداول اليوم: {fmt_num(metrics['day_volume'])}",
+        f"💧 سيولة آخر دقيقة: {fmt_num(metrics['last_1m_vol'])}",
+        f"🔥 قوة السيولة: {metrics['liquidity_power']}x",
+        f"📏 RVOL: {metrics['rvol']}",
+        f"🕌 الشرعية: {metrics['sharia']}",
+        f"🐳 دخول حوت: {metrics['whale']}",
+        f"🏭 عمل الشركة: {metrics['business_ar']}",
+        f"📰 الخبر: {news_title if news_title else 'لا يوجد خبر'}",
+        f"📍 الاتجاه: {metrics['trend']}",
+        f"📌 VWAP: {metrics['vwap']}",
+    ])
 
 
 # =========================
@@ -667,13 +716,12 @@ def scan_once():
             break
 
         symbol = item["symbol"]
-        current_price = safe_float(item["metrics"]["price"], 0.0)
+        news_title = get_news_headline(symbol)
 
-        repeat_number = get_repeat_number(symbol, current_price)
+        repeat_number = get_repeat_number(symbol, item["metrics"], news_title)
         if repeat_number is None:
             continue
 
-        news_title = get_news_headline(symbol)
         text = build_alert_text(
             item["metrics"],
             item["is_gainer"],
@@ -683,7 +731,7 @@ def scan_once():
         )
 
         if send_telegram_message(text):
-            mark_repeat_alert(symbol, current_price, repeat_number)
+            mark_repeat_alert(symbol, item["metrics"], news_title, repeat_number)
             sent_count += 1
             logging.info("Alert sent for %s | repeat=%s", symbol, repeat_number)
 
@@ -698,9 +746,9 @@ def main():
 
     startup = (
         "✅ البوت اشتغل وبدأ فحص السوق الأمريكي\n"
-        "يشمل: Top Gainers + Most Active + Fallback\n"
-        f"نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}\n"
-        f"التنبيه يتكرر فقط إذا واصل السهم الصعود"
+        "🔎 يبحث في: Top Gainers + Most Active + Fallback\n"
+        f"💰 نطاق السعر: {MIN_PRICE} إلى {MAX_PRICE}\n"
+        "♻️ لا يعيد نفس السهم إلا إذا تحسن فعلاً"
     )
     send_telegram_message(startup)
 
