@@ -2,10 +2,11 @@ import os
 import time
 import math
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-import requests
 import pandas as pd
+import requests
 import yfinance as yf
 
 
@@ -96,7 +97,6 @@ def send_telegram_message(text: str) -> bool:
 
 def get_session_label() -> str:
     try:
-        from zoneinfo import ZoneInfo
         now_et = datetime.now(ZoneInfo("America/New_York"))
         hm = now_et.hour * 60 + now_et.minute
         if 4 * 60 <= hm < 9 * 60 + 30:
@@ -110,9 +110,62 @@ def get_session_label() -> str:
         return "غير محدد"
 
 
+def should_send(symbol: str, price: float) -> bool:
+    old = last_sent.get(symbol)
+    if old is None:
+        return True
+
+    old_price = safe_float(old.get("price"), 0.0)
+    if old_price <= 0:
+        return True
+
+    change_pct = ((price - old_price) / old_price) * 100
+    return abs(change_pct) >= 0.3
+
+
+def mark_sent(symbol: str, price: float):
+    old = last_sent.get(symbol, {})
+    count = safe_int(old.get("count"), 0) + 1
+    last_sent[symbol] = {
+        "price": price,
+        "count": count,
+    }
+
+
+def get_repeat_count(symbol: str) -> int:
+    return safe_int(last_sent.get(symbol, {}).get("count"), 0) + 1
+
+
+def clean_downloaded_df(df: pd.DataFrame) -> pd.DataFrame | None:
+    try:
+        if df is None or df.empty:
+            return None
+
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [c[0] for c in df.columns]
+
+        keep = ["Open", "High", "Low", "Close", "Volume"]
+        available = [c for c in keep if c in df.columns]
+        if len(available) < 5:
+            return None
+
+        df = df[keep].copy()
+
+        for col in keep:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        df = df.dropna(subset=["Open", "High", "Low", "Close", "Volume"]).copy()
+        if df.empty:
+            return None
+
+        return df
+    except Exception:
+        return None
+
+
 def fetch_symbol_metrics(symbol: str):
     try:
-        df = yf.download(
+        raw = yf.download(
             tickers=symbol,
             period="2d",
             interval="1m",
@@ -122,18 +175,9 @@ def fetch_symbol_metrics(symbol: str):
             threads=False,
         )
 
+        df = clean_downloaded_df(raw)
         if df is None or df.empty:
-            return None
-
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = [c[0] for c in df.columns]
-
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        if not all(c in df.columns for c in required):
-            return None
-
-        df = df.dropna().copy()
-        if df.empty:
+            logging.info("%s | no clean data", symbol)
             return None
 
         latest = df.iloc[-1]
@@ -150,14 +194,14 @@ def fetch_symbol_metrics(symbol: str):
         day_volume = safe_int(df["Volume"].sum())
         last_1m_vol = safe_int(latest["Volume"])
 
-        # vwap بسيط
-        typical = (df["High"] + df["Low"] + df["Close"]) / 3
+        typical = (df["High"] + df["Low"] + df["Close"]) / 3.0
         tpv = typical * df["Volume"]
         vol_cum = df["Volume"].replace(0, pd.NA).cumsum()
         vwap_series = tpv.cumsum() / vol_cum
         vwap = safe_float(vwap_series.iloc[-1], 0)
 
-        avg_vol20 = safe_float(df["Volume"].replace(0, pd.NA).rolling(20).mean().iloc[-1], 0)
+        avg_vol20_series = df["Volume"].replace(0, pd.NA).rolling(20, min_periods=1).mean()
+        avg_vol20 = safe_float(avg_vol20_series.iloc[-1], 0)
         rvol = (last_1m_vol / avg_vol20) if avg_vol20 > 0 else 0.0
 
         trend = "صعود" if price > vwap and day_change_pct > 0 else "انتظار"
@@ -186,48 +230,21 @@ def fetch_symbol_metrics(symbol: str):
         return None
 
 
-def should_send(symbol: str, price: float) -> bool:
-    old = last_sent.get(symbol)
-    if old is None:
-        return True
-
-    old_price = safe_float(old.get("price"), 0.0)
-    if old_price <= 0:
-        return True
-
-    change_pct = ((price - old_price) / old_price) * 100
-    return abs(change_pct) >= 0.3
-
-
-def mark_sent(symbol: str, price: float):
-    old = last_sent.get(symbol, {})
-    count = safe_int(old.get("count"), 0) + 1
-    last_sent[symbol] = {
-        "price": price,
-        "count": count,
-        "time": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-def get_repeat_count(symbol: str) -> int:
-    return safe_int(last_sent.get(symbol, {}).get("count"), 0) + 1
-
-
 def build_alert_text(m: dict) -> str:
     repeat = get_repeat_count(m["symbol"])
-    top = [f"🚨 تنبيه {repeat}"]
+    badges = [f"🚨 تنبيه {repeat}"]
 
     if m["day_change_pct"] >= 5:
-        top.append("🔥 ارتفاع قوي")
+        badges.append("🔥 ارتفاع قوي")
     if m["rvol"] >= 1:
-        top.append("💧 سيولة")
+        badges.append("💧 سيولة")
     if m["trend"] == "صعود":
-        top.append("✅ صعود")
+        badges.append("✅ صعود")
     else:
-        top.append("⏳ مراقبة")
+        badges.append("⏳ مراقبة")
 
     return "\n".join([
-        " | ".join(top),
+        " | ".join(badges),
         "",
         f"📈 السهم: {m['symbol']}",
         f"🕒 الجلسة: {get_session_label()}",
