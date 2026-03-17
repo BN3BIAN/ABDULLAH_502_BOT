@@ -12,15 +12,17 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
+# إعدادات داخلية ثابتة
 CHECK_INTERVAL = 180
-REQUEST_DELAY = 0.80
-BATCH_SIZE = 20
+REQUEST_DELAY = 0.85
+BATCH_SIZE = 25
 
-MIN_PRICE = 0.30
-MAX_PRICE = 50.0
-MIN_CHANGE_PCT = 1.20
-MIN_OPEN_CHANGE_PCT = 0.80
-RESEND_MOVE_PCT = 0.50
+MIN_PRICE = 0.10
+MAX_PRICE = 20.00
+
+MIN_CHANGE_PCT = 3.0
+MIN_OPEN_CHANGE_PCT = 1.0
+RESEND_MOVE_PCT = 0.60
 MAX_ALERTS_PER_SYMBOL = 20
 
 FINNHUB_URL = "https://finnhub.io/api/v1"
@@ -165,6 +167,88 @@ def get_alert_number(symbol: str) -> int:
     return alert_counter.get(symbol, 0) + 1
 
 
+def translate_industry(industry: str) -> str:
+    if not industry:
+        return "غير محدد"
+
+    raw = industry.strip().lower()
+
+    mapping = {
+        "airlines": "طيران",
+        "biotechnology": "تقنية حيوية",
+        "healthcare": "رعاية صحية",
+        "medical devices": "أجهزة طبية",
+        "pharmaceuticals": "أدوية",
+        "software": "برمجيات",
+        "semiconductors": "أشباه موصلات",
+        "banks": "بنوك",
+        "capital markets": "أسواق مالية",
+        "oil & gas": "نفط وغاز",
+        "oil and gas": "نفط وغاز",
+        "energy": "طاقة",
+        "insurance": "تأمين",
+        "real estate": "عقار",
+        "internet content & information": "محتوى وخدمات إنترنت",
+        "consumer electronics": "إلكترونيات استهلاكية",
+        "telecom services": "اتصالات",
+        "auto manufacturers": "تصنيع سيارات",
+        "specialty retail": "تجزئة متخصصة",
+        "packaged foods": "أغذية معبأة",
+        "aerospace & defense": "فضاء ودفاع",
+        "industrial distribution": "توزيع صناعي",
+        "electrical equipment & parts": "معدات كهربائية",
+        "diagnostics & research": "تشخيص وأبحاث",
+        "drug manufacturers": "تصنيع أدوية",
+        "shell companies": "شركة استحواذ",
+        "asset management": "إدارة أصول",
+        "credit services": "خدمات ائتمانية",
+    }
+
+    return mapping.get(raw, industry)
+
+
+def translate_headline(headline: str) -> str:
+    if not headline:
+        return "لا يوجد خبر"
+
+    text = headline.strip()
+
+    replacements = {
+        "shares": "الأسهم",
+        "share": "السهم",
+        "stock": "السهم",
+        "stocks": "الأسهم",
+        "expands": "توسّع",
+        "reports": "تعلن",
+        "earnings": "الأرباح",
+        "revenue": "الإيرادات",
+        "guidance": "التوقعات",
+        "acquires": "تستحوذ على",
+        "merger": "اندماج",
+        "approval": "موافقة",
+        "fda": "هيئة الغذاء والدواء",
+        "launches": "تطلق",
+        "partnership": "شراكة",
+        "upgrades": "رفع التقييم",
+        "downgrades": "خفض التقييم",
+        "price target": "السعر المستهدف",
+        "american airlines": "أمريكان إيرلاينز",
+        "inc.": "",
+        "corp.": "",
+        "corporation": "شركة",
+    }
+
+    out = text
+    for en, ar in replacements.items():
+        out = out.replace(en, ar)
+        out = out.replace(en.title(), ar)
+        out = out.replace(en.upper(), ar)
+
+    if out == text:
+        return f"يوجد خبر: {text[:90]}"
+    return f"يوجد خبر: {out[:90]}"
+
+
 def size_label(market_cap_m):
     mc = safe_float(market_cap_m, 0)
     if mc <= 0:
@@ -286,6 +370,7 @@ def get_profile(symbol: str):
     data = api_get("/stock/profile2", {"symbol": symbol}, timeout=15)
     if not data:
         profile = {
+            "name": "",
             "industry": "غير محدد",
             "market_cap_m": 0,
             "shares_outstanding_m": 0,
@@ -294,7 +379,8 @@ def get_profile(symbol: str):
         return profile
 
     profile = {
-        "industry": str(data.get("finnhubIndustry", "")).strip() or "غير محدد",
+        "name": str(data.get("name", "")).strip(),
+        "industry": translate_industry(str(data.get("finnhubIndustry", "")).strip()),
         "market_cap_m": safe_float(data.get("marketCapitalization"), 0),
         "shares_outstanding_m": safe_float(data.get("shareOutstanding"), 0),
     }
@@ -322,7 +408,7 @@ def get_latest_news_status(symbol: str):
 
         if isinstance(data, list) and len(data) > 0:
             headline = str(data[0].get("headline", "")).strip()
-            value = f"يوجد خبر: {headline[:90]}" if headline else "يوجد خبر"
+            value = translate_headline(headline)
         else:
             value = "لا يوجد خبر"
 
@@ -337,11 +423,11 @@ def classify_alert(q):
     is_activity = q["open_change_pct"] >= MIN_OPEN_CHANGE_PCT or q["near_day_high"]
 
     if is_rise and is_activity:
-        return "تنبيه ارتفاع + نشاط"
+        return "سهم صاعد بقوة"
     if is_activity:
-        return "تنبيه نشاط"
+        return "سهم نشط"
     if is_rise:
-        return "تنبيه ارتفاع"
+        return "سهم مرتفع"
     return None
 
 
@@ -358,17 +444,19 @@ def detect_state(q):
 def build_alert_text(row):
     alert_no = get_alert_number(row["symbol"])
 
+    name_line = row["company_name"] if row["company_name"] else "غير متاح"
+
     lines = [
         f"📢 {row['alert_type']} | رقم {alert_no}",
         "",
         tag_line("🏷️", "السهم", row["symbol"]),
+        tag_line("🏢", "اسم الشركة", name_line),
         tag_line("💵", "السعر", row["price"]),
         tag_line("📈", "نسبة الارتفاع", pct_str(row["day_change_pct"])),
         tag_line("⚡", "التغير من الافتتاح", pct_str(row["open_change_pct"])),
         tag_line("🧠", "الحالة", row["state"]),
         tag_line("🎯", "قريب من أعلى اليوم", "نعم" if row["near_day_high"] else "لا"),
         tag_line("🧮", "عدد أسهم الشركة", fmt_num(row["shares_outstanding"]) if row["shares_outstanding"] > 0 else "غير متاح"),
-        tag_line("📦", "الأسهم المتاحة", "غير متاح"),
         tag_line("🏭", "نشاط الشركة", row["industry"]),
         tag_line("🏢", "حجم الشركة", row["company_size"]),
         tag_line("🏛️", "القيمة السوقية", fmt_num(row["market_cap"]) if row["market_cap"] > 0 else "غير متاح"),
@@ -425,6 +513,7 @@ def scan_market():
 
         row = {
             "symbol": symbol,
+            "company_name": profile.get("name", ""),
             "price": q["price"],
             "day_change_pct": q["day_change_pct"],
             "open_change_pct": q["open_change_pct"],
@@ -489,8 +578,10 @@ def main():
         return
 
     startup = (
-        "✅ اشتغل البوت بنسخة Finnhub الخفيفة الحقيقية\n"
+        "✅ اشتغل البوت بنسخة Finnhub V4 النهائية\n"
         "بدون candle وبدون قائمة ثابتة\n"
+        "فلترة أقرب لفكرة Top Gainers\n"
+        f"نطاق السعر: {MIN_PRICE}$ إلى {MAX_PRICE}$\n"
         f"تنبيه الارتفاع من: {MIN_CHANGE_PCT}%\n"
         f"الجلسة الحالية: {get_session_label()}"
     )
