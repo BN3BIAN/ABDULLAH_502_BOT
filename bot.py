@@ -12,23 +12,16 @@ FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "150"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.60"))
+CHECK_INTERVAL = 180
+REQUEST_DELAY = 0.80
+BATCH_SIZE = 20
 
-SYMBOL_LIMIT = int(os.getenv("SYMBOL_LIMIT", "40"))
-QUOTE_CANDIDATES_LIMIT = int(os.getenv("QUOTE_CANDIDATES_LIMIT", "8"))
-
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "50.00"))
-
-MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.20"))
-
-MIN_MINUTE_CHANGE = float(os.getenv("MIN_MINUTE_CHANGE", "0.35"))
-MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "1200"))
-MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "15000"))
-
-RESEND_MOVE_PCT = float(os.getenv("RESEND_MOVE_PCT", "0.40"))
-ALERT_MAX_PER_SYMBOL = int(os.getenv("ALERT_MAX_PER_SYMBOL", "20"))
+MIN_PRICE = 0.30
+MAX_PRICE = 50.0
+MIN_CHANGE_PCT = 1.20
+MIN_OPEN_CHANGE_PCT = 0.80
+RESEND_MOVE_PCT = 0.50
+MAX_ALERTS_PER_SYMBOL = 20
 
 FINNHUB_URL = "https://finnhub.io/api/v1"
 
@@ -38,12 +31,13 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-last_sent = {}
-alert_counter = {}
-profile_cache = {}
-news_cache = {}
 symbols_cache = []
 symbols_cache_ts = 0.0
+profile_cache = {}
+news_cache = {}
+last_sent = {}
+alert_counter = {}
+scan_offset = 0
 
 
 def safe_float(x, default=0.0):
@@ -101,7 +95,6 @@ def tag_line(icon, label, value):
 
 def require_env():
     missing = []
-
     if not FINNHUB_API_KEY:
         missing.append("FINNHUB_API_KEY")
     if not TELEGRAM_BOT_TOKEN:
@@ -110,11 +103,9 @@ def require_env():
         missing.append("TELEGRAM_CHAT_ID")
 
     if missing:
-        msg = "Missing required variables: " + ", ".join(missing)
-        logging.error(msg)
-        return False, msg
-
-    return True, ""
+        logging.error("Missing required variables: %s", ", ".join(missing))
+        return False
+    return True
 
 
 def api_get(path: str, params=None, timeout=20):
@@ -134,28 +125,21 @@ def api_get(path: str, params=None, timeout=20):
 
         r.raise_for_status()
         return r.json()
-
     except Exception as e:
         logging.exception("api_get error | %s | %s", path, e)
         return None
 
 
 def send_telegram_message(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text
-    }
-
     try:
-        r = session.post(url, json=payload, timeout=20)
-        if r.status_code == 200:
-            return True
-
-        logging.error("Telegram send failed: %s | %s", r.status_code, r.text)
-        return False
+        r = session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=20
+        )
+        return r.status_code == 200
     except Exception as e:
-        logging.exception("Telegram exception: %s", e)
+        logging.exception("Telegram send failed: %s", e)
         return False
 
 
@@ -164,7 +148,7 @@ def should_send(symbol: str, price: float) -> bool:
     if old is None:
         return True
 
-    old_price = safe_float(old.get("price"), 0.0)
+    old_price = safe_float(old.get("price"), 0)
     if old_price <= 0:
         return True
 
@@ -181,17 +165,31 @@ def get_alert_number(symbol: str) -> int:
     return alert_counter.get(symbol, 0) + 1
 
 
+def size_label(market_cap_m):
+    mc = safe_float(market_cap_m, 0)
+    if mc <= 0:
+        return "غير محدد"
+    if mc < 300:
+        return "مايكرو"
+    if mc < 2_000:
+        return "صغيرة"
+    if mc < 10_000:
+        return "متوسطة"
+    if mc < 200_000:
+        return "كبيرة"
+    return "عملاقة"
+
+
 def get_market_symbols():
     global symbols_cache, symbols_cache_ts
 
     now_ts = time.time()
     if symbols_cache and (now_ts - symbols_cache_ts) < 43200:
-        return symbols_cache[:SYMBOL_LIMIT]
+        return symbols_cache
 
     data = api_get("/stock/symbol", {"exchange": "US"}, timeout=40)
-
     if not data:
-        return symbols_cache[:SYMBOL_LIMIT] if symbols_cache else []
+        return symbols_cache if symbols_cache else []
 
     symbols = []
 
@@ -225,7 +223,24 @@ def get_market_symbols():
     symbols = sorted(set(symbols))
     symbols_cache = symbols
     symbols_cache_ts = now_ts
-    return symbols[:SYMBOL_LIMIT]
+    return symbols
+
+
+def get_next_batch(symbols):
+    global scan_offset
+
+    if not symbols:
+        return []
+
+    start = scan_offset
+    end = start + BATCH_SIZE
+    batch = symbols[start:end]
+
+    if len(batch) < BATCH_SIZE:
+        batch += symbols[: max(0, BATCH_SIZE - len(batch))]
+
+    scan_offset = (scan_offset + BATCH_SIZE) % len(symbols)
+    return batch
 
 
 def get_quote(symbol: str):
@@ -248,6 +263,10 @@ def get_quote(symbol: str):
     if open_price > 0:
         open_change_pct = ((price - open_price) / open_price) * 100
 
+    near_day_high = False
+    if high_price > 0:
+        near_day_high = price >= (high_price * 0.992)
+
     return {
         "price": round(price, 4),
         "day_change_pct": round(day_change_pct, 2),
@@ -255,61 +274,7 @@ def get_quote(symbol: str):
         "open": round(open_price, 4) if open_price > 0 else 0,
         "high": round(high_price, 4) if high_price > 0 else 0,
         "low": round(low_price, 4) if low_price > 0 else 0,
-    }
-
-
-def get_candles(symbol: str):
-    now_ts = int(time.time())
-    start_ts = now_ts - (60 * 90)
-
-    data = api_get(
-        "/stock/candle",
-        {
-            "symbol": symbol,
-            "resolution": "1",
-            "from": start_ts,
-            "to": now_ts,
-        },
-        timeout=20
-    )
-
-    if not data or data.get("s") != "ok":
-        return None
-
-    closes = data.get("c", [])
-    highs = data.get("h", [])
-    volumes = data.get("v", [])
-
-    if len(closes) < 25 or len(highs) < 25 or len(volumes) < 25:
-        return None
-
-    price = safe_float(closes[-1], 0)
-    prev_close = safe_float(closes[-2], 0)
-    last_1m_vol = int(safe_float(volumes[-1], 0))
-    day_volume = int(sum(safe_float(v, 0) for v in volumes))
-
-    if price <= 0 or prev_close <= 0:
-        return None
-
-    minute_change_pct = ((price - prev_close) / prev_close) * 100
-
-    last3_first = safe_float(closes[-3], 0)
-    momentum_3m_pct = 0.0
-    if last3_first > 0:
-        momentum_3m_pct = ((price - last3_first) / last3_first) * 100
-
-    prev_20_high = max(safe_float(x, 0) for x in highs[-21:-1]) if len(highs) >= 21 else 0
-    current_liquidity = price * last_1m_vol
-    total_liquidity = price * day_volume
-
-    return {
-        "minute_change_pct": round(minute_change_pct, 2),
-        "momentum_3m_pct": round(momentum_3m_pct, 2),
-        "last_1m_vol": last_1m_vol,
-        "day_volume": day_volume,
-        "current_liquidity": current_liquidity,
-        "total_liquidity": total_liquidity,
-        "prev_20_high": round(prev_20_high, 4),
+        "near_day_high": near_day_high,
     }
 
 
@@ -322,6 +287,7 @@ def get_profile(symbol: str):
     if not data:
         profile = {
             "industry": "غير محدد",
+            "market_cap_m": 0,
             "shares_outstanding_m": 0,
         }
         profile_cache[symbol] = profile
@@ -329,6 +295,7 @@ def get_profile(symbol: str):
 
     profile = {
         "industry": str(data.get("finnhubIndustry", "")).strip() or "غير محدد",
+        "market_cap_m": safe_float(data.get("marketCapitalization"), 0),
         "shares_outstanding_m": safe_float(data.get("shareOutstanding"), 0),
     }
     profile_cache[symbol] = profile
@@ -339,7 +306,7 @@ def get_latest_news_status(symbol: str):
     cached = news_cache.get(symbol)
     now_ts = time.time()
 
-    if cached and (now_ts - cached["ts"]) < 1800:
+    if cached and (now_ts - cached["ts"]) < 3600:
         return cached["value"]
 
     try:
@@ -349,11 +316,7 @@ def get_latest_news_status(symbol: str):
 
         data = api_get(
             "/company-news",
-            {
-                "symbol": symbol,
-                "from": from_date,
-                "to": to_date,
-            },
+            {"symbol": symbol, "from": from_date, "to": to_date},
             timeout=15
         )
 
@@ -365,112 +328,51 @@ def get_latest_news_status(symbol: str):
 
         news_cache[symbol] = {"value": value, "ts": now_ts}
         return value
-
     except Exception:
         return "لا يوجد خبر"
 
 
-def choose_quote_candidates(symbols):
-    logging.info("🔍 بدأ الفحص...")
-    logging.info("عدد الأسهم المفحوصة في مرحلة quote: %s", len(symbols))
+def classify_alert(q):
+    is_rise = q["day_change_pct"] >= MIN_CHANGE_PCT
+    is_activity = q["open_change_pct"] >= MIN_OPEN_CHANGE_PCT or q["near_day_high"]
 
-    candidates = []
-    stats = {
-        "total": 0,
-        "quote_fail": 0,
-        "price_filtered": 0,
-        "weak_filtered": 0,
-        "accepted": 0,
-    }
-
-    for symbol in symbols:
-        stats["total"] += 1
-
-        quote = get_quote(symbol)
-        time.sleep(REQUEST_DELAY + 0.2)
-
-        if not quote:
-            stats["quote_fail"] += 1
-            continue
-
-        price = safe_float(quote["price"], 0)
-        day_change_pct = safe_float(quote["day_change_pct"], 0)
-        open_change_pct = safe_float(quote["open_change_pct"], 0)
-
-        if not (MIN_PRICE <= price <= MAX_PRICE):
-            stats["price_filtered"] += 1
-            continue
-
-        if day_change_pct < MIN_CHANGE and open_change_pct < 0.80:
-            stats["weak_filtered"] += 1
-            continue
-
-        quote_score = (
-            max(0, day_change_pct) * 4
-            + max(0, open_change_pct) * 2
-        )
-
-        candidates.append({
-            "symbol": symbol,
-            "quote": quote,
-            "quote_score": round(quote_score, 2),
-        })
-        stats["accepted"] += 1
-
-    candidates.sort(key=lambda x: x["quote_score"], reverse=True)
-    logging.info("Quote summary: %s", stats)
-    return candidates[:QUOTE_CANDIDATES_LIMIT]
-
-
-def classify_alert(day_change_pct, minute_change_pct, momentum_3m_pct, last_1m_vol):
-    is_rise = day_change_pct >= MIN_CHANGE
-    is_momentum = (
-        minute_change_pct >= MIN_MINUTE_CHANGE
-        and momentum_3m_pct >= 0.40
-        and last_1m_vol >= MIN_LAST_1M_VOL
-    )
-
-    if is_rise and is_momentum:
-        return "تنبيه زخم + ارتفاع"
-    if is_momentum:
-        return "تنبيه زخم"
+    if is_rise and is_activity:
+        return "تنبيه ارتفاع + نشاط"
+    if is_activity:
+        return "تنبيه نشاط"
     if is_rise:
         return "تنبيه ارتفاع"
     return None
 
 
-def detect_state(price, prev_20_high, day_change_pct, minute_change_pct):
-    if prev_20_high > 0 and price > prev_20_high:
-        return "اختراق قمة سابقة"
-
-    if day_change_pct >= MIN_CHANGE and minute_change_pct >= 0:
+def detect_state(q):
+    if q["near_day_high"] and q["day_change_pct"] >= MIN_CHANGE_PCT:
+        return "قريب من قمة اليوم"
+    if q["day_change_pct"] >= MIN_CHANGE_PCT and q["open_change_pct"] >= 0:
         return "صعود"
-
-    if day_change_pct >= MIN_CHANGE and minute_change_pct < 0:
+    if q["day_change_pct"] >= MIN_CHANGE_PCT and q["open_change_pct"] < 0:
         return "احتمال وهمي"
-
     return "مراقبة"
 
 
-def build_alert_text(m: dict) -> str:
-    alert_no = get_alert_number(m["symbol"])
+def build_alert_text(row):
+    alert_no = get_alert_number(row["symbol"])
 
     lines = [
-        f"📢 {m['alert_type']} | رقم {alert_no}",
+        f"📢 {row['alert_type']} | رقم {alert_no}",
         "",
-        tag_line("🏷️", "السهم", m["symbol"]),
-        tag_line("💵", "السعر", m["price"]),
-        tag_line("📈", "نسبة الارتفاع", pct_str(m["day_change_pct"])),
-        tag_line("⚡", "زخم آخر دقيقة", pct_str(m["minute_change_pct"])),
-        tag_line("🚀", "زخم 3 دقائق", pct_str(m["momentum_3m_pct"])),
-        tag_line("🧠", "الحالة", m["state"]),
-        tag_line("📊", "حجم التداول", fmt_num(m["day_volume"])),
-        tag_line("🪙", "سيولة آخر دقيقة", fmt_num(m["current_liquidity"])),
-        tag_line("💰", "إجمالي السيولة", fmt_num(m["total_liquidity"])),
-        tag_line("🧮", "عدد أسهم الشركة", fmt_num(m["shares_outstanding"]) if m["shares_outstanding"] > 0 else "غير متاح"),
-        tag_line("📦", "الأسهم المتاحة", m["float_text"]),
-        tag_line("🏭", "نشاط الشركة", m["industry"]),
-        tag_line("📰", "الخبر", m["news"]),
+        tag_line("🏷️", "السهم", row["symbol"]),
+        tag_line("💵", "السعر", row["price"]),
+        tag_line("📈", "نسبة الارتفاع", pct_str(row["day_change_pct"])),
+        tag_line("⚡", "التغير من الافتتاح", pct_str(row["open_change_pct"])),
+        tag_line("🧠", "الحالة", row["state"]),
+        tag_line("🎯", "قريب من أعلى اليوم", "نعم" if row["near_day_high"] else "لا"),
+        tag_line("🧮", "عدد أسهم الشركة", fmt_num(row["shares_outstanding"]) if row["shares_outstanding"] > 0 else "غير متاح"),
+        tag_line("📦", "الأسهم المتاحة", "غير متاح"),
+        tag_line("🏭", "نشاط الشركة", row["industry"]),
+        tag_line("🏢", "حجم الشركة", row["company_size"]),
+        tag_line("🏛️", "القيمة السوقية", fmt_num(row["market_cap"]) if row["market_cap"] > 0 else "غير متاح"),
+        tag_line("📰", "الخبر", row["news"]),
         tag_line("🕒", "الجلسة", get_session_label()),
     ]
     return "\n".join(lines)
@@ -482,84 +384,65 @@ def scan_market():
         logging.warning("لم يتم جلب أي رموز.")
         return []
 
-    quote_candidates = choose_quote_candidates(symbols)
-    logging.info("Quote candidates selected: %s", len(quote_candidates))
+    batch = get_next_batch(symbols)
+    logging.info("🔍 بدأ الفحص...")
+    logging.info("عدد الأسهم المفحوصة هذه الدورة: %s", len(batch))
 
-    results = []
+    rows = []
     stats = {
-        "candle_fail": 0,
-        "volume_filtered": 0,
+        "total": 0,
+        "quote_fail": 0,
+        "price_filtered": 0,
         "no_alert": 0,
         "accepted": 0,
     }
 
-    for item in quote_candidates:
-        symbol = item["symbol"]
-        quote = item["quote"]
+    for symbol in batch:
+        stats["total"] += 1
 
-        candles = get_candles(symbol)
+        q = get_quote(symbol)
         time.sleep(REQUEST_DELAY)
 
-        if not candles:
-            stats["candle_fail"] += 1
+        if not q:
+            stats["quote_fail"] += 1
             continue
 
-        day_volume = int(candles["day_volume"])
-        last_1m_vol = int(candles["last_1m_vol"])
-
-        if day_volume < MIN_DAY_VOLUME:
-            stats["volume_filtered"] += 1
+        price = safe_float(q["price"], 0)
+        if not (MIN_PRICE <= price <= MAX_PRICE):
+            stats["price_filtered"] += 1
             continue
 
-        price = safe_float(quote["price"], 0)
-        day_change_pct = safe_float(quote["day_change_pct"], 0)
-        minute_change_pct = safe_float(candles["minute_change_pct"], 0)
-        momentum_3m_pct = safe_float(candles["momentum_3m_pct"], 0)
-
-        alert_type = classify_alert(
-            day_change_pct=day_change_pct,
-            minute_change_pct=minute_change_pct,
-            momentum_3m_pct=momentum_3m_pct,
-            last_1m_vol=last_1m_vol,
-        )
-
+        alert_type = classify_alert(q)
         if not alert_type:
             stats["no_alert"] += 1
             continue
 
         profile = get_profile(symbol)
-        time.sleep(0.15)
+        time.sleep(0.20)
 
         shares_outstanding = safe_float(profile.get("shares_outstanding_m", 0), 0) * 1_000_000
-        industry = profile.get("industry", "غير محدد")
+        market_cap = safe_float(profile.get("market_cap_m", 0), 0) * 1_000_000
 
-        state = detect_state(
-            price=price,
-            prev_20_high=safe_float(candles["prev_20_high"], 0),
-            day_change_pct=day_change_pct,
-            minute_change_pct=minute_change_pct,
-        )
-
-        results.append({
+        row = {
             "symbol": symbol,
-            "price": round(price, 4),
-            "day_change_pct": round(day_change_pct, 2),
-            "minute_change_pct": round(minute_change_pct, 2),
-            "momentum_3m_pct": round(momentum_3m_pct, 2),
+            "price": q["price"],
+            "day_change_pct": q["day_change_pct"],
+            "open_change_pct": q["open_change_pct"],
+            "near_day_high": q["near_day_high"],
             "alert_type": alert_type,
-            "state": state,
-            "day_volume": day_volume,
-            "current_liquidity": candles["current_liquidity"],
-            "total_liquidity": candles["total_liquidity"],
+            "state": detect_state(q),
+            "industry": profile.get("industry", "غير محدد"),
             "shares_outstanding": shares_outstanding,
-            "float_text": "غير متاح",
-            "industry": industry,
+            "market_cap": market_cap,
+            "company_size": size_label(profile.get("market_cap_m", 0)),
             "news": "",
-        })
+        }
+
+        rows.append(row)
         stats["accepted"] += 1
 
-    logging.info("Candle summary: %s", stats)
-    return results
+    logging.info("Scan summary: %s", stats)
+    return rows
 
 
 def send_alerts(rows):
@@ -571,8 +454,8 @@ def send_alerts(rows):
         rows,
         key=lambda x: (
             x["day_change_pct"],
-            x["minute_change_pct"],
-            x["day_volume"]
+            x["open_change_pct"],
+            1 if x["near_day_high"] else 0
         ),
         reverse=True
     )
@@ -583,18 +466,16 @@ def send_alerts(rows):
         symbol = row["symbol"]
         price = row["price"]
 
-        if alert_counter.get(symbol, 0) >= ALERT_MAX_PER_SYMBOL:
+        if alert_counter.get(symbol, 0) >= MAX_ALERTS_PER_SYMBOL:
             continue
 
         if not should_send(symbol, price):
             continue
 
         row["news"] = get_latest_news_status(symbol)
-        time.sleep(0.15)
+        time.sleep(0.20)
 
-        text = build_alert_text(row)
-
-        if send_telegram_message(text):
+        if send_telegram_message(build_alert_text(row)):
             mark_sent(symbol, price)
             sent += 1
             logging.info("Alert sent for %s | %s", symbol, row["alert_type"])
@@ -604,16 +485,13 @@ def send_alerts(rows):
 
 
 def main():
-    ok, msg = require_env()
-    if not ok:
-        logging.error(msg)
+    if not require_env():
         return
 
     startup = (
-        "✅ اشتغل البوت بنسخة Finnhub المخففة\n"
-        "تم تقليل الفحص لتخفيف 429\n"
-        f"تنبيه الارتفاع من: {MIN_CHANGE}%\n"
-        f"تنبيه الزخم من: {MIN_MINUTE_CHANGE}% آخر دقيقة\n"
+        "✅ اشتغل البوت بنسخة Finnhub الخفيفة الحقيقية\n"
+        "بدون candle وبدون قائمة ثابتة\n"
+        f"تنبيه الارتفاع من: {MIN_CHANGE_PCT}%\n"
         f"الجلسة الحالية: {get_session_label()}"
     )
     send_telegram_message(startup)
