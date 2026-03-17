@@ -8,32 +8,25 @@ from zoneinfo import ZoneInfo
 import requests
 
 
-# =========================
-# ENV
-# =========================
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "90"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.30"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "150"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.60"))
 
-# فحص السوق بدون قائمة ثابتة
-SYMBOL_LIMIT = int(os.getenv("SYMBOL_LIMIT", "90"))
-QUOTE_CANDIDATES_LIMIT = int(os.getenv("QUOTE_CANDIDATES_LIMIT", "15"))
+SYMBOL_LIMIT = int(os.getenv("SYMBOL_LIMIT", "40"))
+QUOTE_CANDIDATES_LIMIT = int(os.getenv("QUOTE_CANDIDATES_LIMIT", "8"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "50.00"))
 
-# تنبيه ارتفاع
 MIN_CHANGE = float(os.getenv("MIN_CHANGE", "1.20"))
 
-# تنبيه زخم
 MIN_MINUTE_CHANGE = float(os.getenv("MIN_MINUTE_CHANGE", "0.35"))
 MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "1200"))
 MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "15000"))
 
-# منع التكرار
 RESEND_MOVE_PCT = float(os.getenv("RESEND_MOVE_PCT", "0.40"))
 ALERT_MAX_PER_SYMBOL = int(os.getenv("ALERT_MAX_PER_SYMBOL", "20"))
 
@@ -48,13 +41,11 @@ session = requests.Session()
 last_sent = {}
 alert_counter = {}
 profile_cache = {}
+news_cache = {}
 symbols_cache = []
 symbols_cache_ts = 0.0
 
 
-# =========================
-# HELPERS
-# =========================
 def safe_float(x, default=0.0):
     try:
         if x is None:
@@ -190,9 +181,6 @@ def get_alert_number(symbol: str) -> int:
     return alert_counter.get(symbol, 0) + 1
 
 
-# =========================
-# DATA
-# =========================
 def get_market_symbols():
     global symbols_cache, symbols_cache_ts
 
@@ -201,29 +189,40 @@ def get_market_symbols():
         return symbols_cache[:SYMBOL_LIMIT]
 
     data = api_get("/stock/symbol", {"exchange": "US"}, timeout=40)
+
     if not data:
         return symbols_cache[:SYMBOL_LIMIT] if symbols_cache else []
 
     symbols = []
 
     for item in data:
-        symbol = str(item.get("symbol", "")).strip().upper()
-        typ = str(item.get("type", "")).strip().upper()
+        try:
+            if isinstance(item, dict):
+                symbol = str(item.get("symbol", "")).strip().upper()
+                typ = str(item.get("type", "")).strip().upper()
 
-        if not symbol:
-            continue
-        if "." in symbol or "^" in symbol:
-            continue
-        if not symbol.isalpha():
-            continue
-        if len(symbol) > 5:
-            continue
-        if typ and typ not in {"COMMON STOCK", "ADR"}:
+                if not symbol:
+                    continue
+                if "." in symbol or "^" in symbol:
+                    continue
+                if not symbol.isalpha():
+                    continue
+                if len(symbol) > 5:
+                    continue
+                if typ and typ not in {"COMMON STOCK", "ADR"}:
+                    continue
+
+                symbols.append(symbol)
+
+            elif isinstance(item, str):
+                symbol = item.strip().upper()
+                if symbol.isalpha() and len(symbol) <= 5:
+                    symbols.append(symbol)
+
+        except Exception:
             continue
 
-        symbols.append(symbol)
-
-    symbols = sorted(set(symbols), key=lambda x: (len(x), x))
+    symbols = sorted(set(symbols))
     symbols_cache = symbols
     symbols_cache_ts = now_ts
     return symbols[:SYMBOL_LIMIT]
@@ -337,6 +336,12 @@ def get_profile(symbol: str):
 
 
 def get_latest_news_status(symbol: str):
+    cached = news_cache.get(symbol)
+    now_ts = time.time()
+
+    if cached and (now_ts - cached["ts"]) < 1800:
+        return cached["value"]
+
     try:
         today = datetime.utcnow().date()
         from_date = (today - timedelta(days=3)).isoformat()
@@ -354,15 +359,17 @@ def get_latest_news_status(symbol: str):
 
         if isinstance(data, list) and len(data) > 0:
             headline = str(data[0].get("headline", "")).strip()
-            return f"يوجد خبر: {headline[:90]}" if headline else "يوجد خبر"
-        return "لا يوجد خبر"
+            value = f"يوجد خبر: {headline[:90]}" if headline else "يوجد خبر"
+        else:
+            value = "لا يوجد خبر"
+
+        news_cache[symbol] = {"value": value, "ts": now_ts}
+        return value
+
     except Exception:
         return "لا يوجد خبر"
 
 
-# =========================
-# ENGINE
-# =========================
 def choose_quote_candidates(symbols):
     logging.info("🔍 بدأ الفحص...")
     logging.info("عدد الأسهم المفحوصة في مرحلة quote: %s", len(symbols))
@@ -380,7 +387,7 @@ def choose_quote_candidates(symbols):
         stats["total"] += 1
 
         quote = get_quote(symbol)
-        time.sleep(REQUEST_DELAY)
+        time.sleep(REQUEST_DELAY + 0.2)
 
         if not quote:
             stats["quote_fail"] += 1
@@ -394,7 +401,6 @@ def choose_quote_candidates(symbols):
             stats["price_filtered"] += 1
             continue
 
-        # نختار السهم إذا فيه ارتفاع أو بداية زخم من quote
         if day_change_pct < MIN_CHANGE and open_change_pct < 0.80:
             stats["weak_filtered"] += 1
             continue
@@ -522,7 +528,7 @@ def scan_market():
             continue
 
         profile = get_profile(symbol)
-        time.sleep(0.10)
+        time.sleep(0.15)
 
         shares_outstanding = safe_float(profile.get("shares_outstanding_m", 0), 0) * 1_000_000
         industry = profile.get("industry", "غير محدد")
@@ -561,7 +567,6 @@ def send_alerts(rows):
         logging.info("لا توجد إشارات هذه الدورة.")
         return
 
-    # نرتب الأقوى أولًا
     rows = sorted(
         rows,
         key=lambda x: (
@@ -585,7 +590,7 @@ def send_alerts(rows):
             continue
 
         row["news"] = get_latest_news_status(symbol)
-        time.sleep(0.10)
+        time.sleep(0.15)
 
         text = build_alert_text(row)
 
@@ -605,8 +610,8 @@ def main():
         return
 
     startup = (
-        "✅ اشتغل البوت بنسخة Finnhub المبسطة\n"
-        "يفحص السوق بدون قائمة ثابتة\n"
+        "✅ اشتغل البوت بنسخة Finnhub المخففة\n"
+        "تم تقليل الفحص لتخفيف 429\n"
         f"تنبيه الارتفاع من: {MIN_CHANGE}%\n"
         f"تنبيه الزخم من: {MIN_MINUTE_CHANGE}% آخر دقيقة\n"
         f"الجلسة الحالية: {get_session_label()}"
