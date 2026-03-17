@@ -1,6 +1,8 @@
 import os
 import time
 import math
+import json
+import hashlib
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -9,25 +11,25 @@ import requests
 import pandas as pd
 
 
+# =========================
+# ENV
+# =========================
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-TOP_ALERTS_PER_SCAN = int(os.getenv("TOP_ALERTS_PER_SCAN", "5"))
-REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.35"))
-DEBUG_MODE = os.getenv("DEBUG_MODE", "true").strip().lower() == "true"
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.10"))
+SCAN_SYMBOL_LIMIT = int(os.getenv("SCAN_SYMBOL_LIMIT", "300"))
 
-# مهم جدًا: حط قائمة الأسهم اللي تبي تراقبها
-WATCHLIST_RAW = os.getenv(
-    "WATCHLIST",
-    "LCID,SOUN,PLTR,HOOD,AMD,NVDA,TSLA,MARA,RIOT,SOFI,RKLB,IONQ,QBTS,RGTI,ACHR,JOBY,OPEN,AFRM,HIMS,TLRY"
-).strip()
-
-MARKET_SYMBOL_LIMIT = int(os.getenv("MARKET_SYMBOL_LIMIT", "50"))
+TOP_GAINERS_COUNT = int(os.getenv("TOP_GAINERS_COUNT", "5"))
+TOP_POWER_COUNT = int(os.getenv("TOP_POWER_COUNT", "5"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.30"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "30.00"))
+
+MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "50000"))
+MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "1200"))
 
 FAST_MIN_DAY_CHANGE = float(os.getenv("FAST_MIN_DAY_CHANGE", "2.0"))
 FAST_MIN_MINUTE_CHANGE = float(os.getenv("FAST_MIN_MINUTE_CHANGE", "0.10"))
@@ -37,12 +39,10 @@ TREND_MIN_DAY_CHANGE = float(os.getenv("TREND_MIN_DAY_CHANGE", "3.0"))
 TREND_MIN_MINUTE_CHANGE = float(os.getenv("TREND_MIN_MINUTE_CHANGE", "0.00"))
 TREND_MIN_RVOL = float(os.getenv("TREND_MIN_RVOL", "0.90"))
 
-MIN_LAST_1M_VOL = int(os.getenv("MIN_LAST_1M_VOL", "800"))
-MIN_DAY_VOLUME = int(os.getenv("MIN_DAY_VOLUME", "20000"))
-
-# إعادة إرسال التنبيه بعد مدة أو تحرك كافي
-ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "15"))
-RESEND_MOVE_PCT = float(os.getenv("RESEND_MOVE_PCT", "0.5"))
+RESEND_MOVE_PCT = float(os.getenv("RESEND_MOVE_PCT", "0.35"))
+TOP_LIST_MIN_CHANGE_PCT = float(os.getenv("TOP_LIST_MIN_CHANGE_PCT", "0.20"))
+ALERT_MAX_PER_SYMBOL = int(os.getenv("ALERT_MAX_PER_SYMBOL", "20"))
+DEBUG_MODE = os.getenv("DEBUG_MODE", "true").strip().lower() == "true"
 
 FINNHUB_URL = "https://finnhub.io/api/v1"
 
@@ -52,49 +52,17 @@ logging.basicConfig(
 )
 
 session = requests.Session()
+
 last_sent = {}
+alert_counter = {}
+profile_cache = {}
+last_top_gainers_hash = None
+last_top_power_hash = None
 
 
-def normalize_symbols(raw: str):
-    if not raw:
-        return []
-    out = []
-    seen = set()
-    for x in raw.split(","):
-        s = x.strip().upper()
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
-
-def parse_float_map(raw: str):
-    result = {}
-    if not raw:
-        return result
-
-    for item in raw.split(","):
-        item = item.strip()
-        if not item or ":" not in item:
-            continue
-
-        sym, val = item.split(":", 1)
-        sym = sym.strip().upper()
-
-        try:
-            result[sym] = float(val.strip())
-        except Exception:
-            continue
-
-    return result
-
-
-SHARIAH_COMPLIANT = set(normalize_symbols(os.getenv("SHARIAH_COMPLIANT", "")))
-SHARIAH_NON_COMPLIANT = set(normalize_symbols(os.getenv("SHARIAH_NON_COMPLIANT", "")))
-FLOAT_SHARES_MAP = parse_float_map(os.getenv("FLOAT_SHARES_MAP", ""))
-WATCHLIST = normalize_symbols(WATCHLIST_RAW)
-
-
+# =========================
+# HELPERS
+# =========================
 def safe_float(x, default=0.0):
     try:
         if x is None:
@@ -128,15 +96,6 @@ def pct_str(x):
         return "0%"
 
 
-def get_shariah_status(symbol: str) -> str:
-    s = symbol.upper().strip()
-    if s in SHARIAH_COMPLIANT:
-        return "شرعي"
-    if s in SHARIAH_NON_COMPLIANT:
-        return "غير شرعي"
-    return "غير محدد"
-
-
 def get_session_label():
     try:
         now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -155,7 +114,6 @@ def get_session_label():
 
 def require_env():
     missing = []
-
     if not FINNHUB_API_KEY:
         missing.append("FINNHUB_API_KEY")
     if not TELEGRAM_BOT_TOKEN:
@@ -167,26 +125,22 @@ def require_env():
         msg = "Missing required variables: " + ", ".join(missing)
         logging.error(msg)
         return False, msg
-
     return True, ""
 
 
 def api_get(path: str, params=None, timeout=20):
     params = params or {}
     params["token"] = FINNHUB_API_KEY
-    url = f"{FINNHUB_URL}{path}"
 
     try:
-        r = session.get(url, params=params, timeout=timeout)
-
+        r = session.get(f"{FINNHUB_URL}{path}", params=params, timeout=timeout)
         if r.status_code == 403:
-            logging.warning("Finnhub 403 forbidden on %s", path)
+            logging.warning("403 forbidden on %s", path)
             return None
-
         r.raise_for_status()
         return r.json()
     except Exception as e:
-        logging.exception("API GET failed | %s | %s", path, e)
+        logging.exception("api_get error | %s | %s", path, e)
         return None
 
 
@@ -204,10 +158,35 @@ def send_telegram_message(text: str) -> bool:
 
         logging.error("Telegram send failed: %s | %s", r.status_code, r.text)
         return False
-
     except Exception as e:
         logging.exception("Telegram exception: %s", e)
         return False
+
+
+def make_rows_hash(rows, keys):
+    compact = []
+    for r in rows:
+        compact.append({k: r.get(k) for k in keys})
+    raw = json.dumps(compact, sort_keys=True, ensure_ascii=False)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def detect_material_top_change(rows, previous_rows_map):
+    if not previous_rows_map:
+        return True
+
+    for row in rows:
+        old = previous_rows_map.get(row["symbol"])
+        if old is None:
+            return True
+
+        old_day = safe_float(old.get("day_change_pct"), 0)
+        new_day = safe_float(row.get("day_change_pct"), 0)
+
+        if abs(new_day - old_day) >= TOP_LIST_MIN_CHANGE_PCT:
+            return True
+
+    return False
 
 
 def should_send(symbol: str, price: float) -> bool:
@@ -216,37 +195,50 @@ def should_send(symbol: str, price: float) -> bool:
         return True
 
     old_price = safe_float(old.get("price"), 0.0)
-    old_ts = safe_float(old.get("ts"), 0.0)
-    now_ts = time.time()
-
     if old_price <= 0:
         return True
 
     change_pct = ((price - old_price) / old_price) * 100
-    age_minutes = (now_ts - old_ts) / 60 if old_ts > 0 else 9999
-
-    if abs(change_pct) >= RESEND_MOVE_PCT:
-        return True
-
-    if age_minutes >= ALERT_COOLDOWN_MINUTES:
-        return True
-
-    return False
+    return abs(change_pct) >= RESEND_MOVE_PCT
 
 
 def mark_sent(symbol: str, price: float):
-    last_sent[symbol] = {
-        "price": price,
-        "ts": time.time()
-    }
+    last_sent[symbol] = {"price": price}
+    alert_counter[symbol] = alert_counter.get(symbol, 0) + 1
 
 
+def get_alert_number(symbol: str) -> int:
+    return alert_counter.get(symbol, 0) + 1
+
+
+def size_label(market_cap_m):
+    mc = safe_float(market_cap_m, 0)
+    if mc <= 0:
+        return "غير محدد"
+    if mc < 300:
+        return "مايكرو"
+    if mc < 2_000:
+        return "صغيرة"
+    if mc < 10_000:
+        return "متوسطة"
+    if mc < 200_000:
+        return "كبيرة"
+    return "عملاقة"
+
+
+def label_bool(v, yes_text="نعم", no_text="لا"):
+    return yes_text if v else no_text
+
+
+def tag_line(icon, label, value):
+    return f"{icon} {label}: {value}"
+
+
+# =========================
+# FINNHUB DATA
+# =========================
 def get_market_symbols():
-    # الأولوية للـ WATCHLIST لأنها أفضل من أول 25 سهم عشوائي
-    if WATCHLIST:
-        return WATCHLIST[:MARKET_SYMBOL_LIMIT]
-
-    data = api_get("/stock/symbol", {"exchange": "US"}, timeout=30)
+    data = api_get("/stock/symbol", {"exchange": "US"}, timeout=40)
     if not data:
         return []
 
@@ -268,14 +260,13 @@ def get_market_symbols():
             continue
 
         symbols.append(symbol)
-        if len(symbols) >= MARKET_SYMBOL_LIMIT:
-            break
 
-    return symbols
+    symbols = sorted(set(symbols), key=lambda x: (len(x), x))
+    return symbols[:SCAN_SYMBOL_LIMIT]
 
 
 def get_quote(symbol: str):
-    data = api_get("/quote", {"symbol": symbol}, timeout=20)
+    data = api_get("/quote", {"symbol": symbol}, timeout=15)
     if not data:
         return None
 
@@ -301,26 +292,30 @@ def get_quote(symbol: str):
 
 
 def get_profile(symbol: str):
-    data = api_get("/stock/profile2", {"symbol": symbol}, timeout=20)
+    cached = profile_cache.get(symbol)
+    if cached:
+        return cached
+
+    data = api_get("/stock/profile2", {"symbol": symbol}, timeout=15)
 
     if not data:
-        return {
+        profile = {
             "name": "",
+            "industry": "غير محدد",
             "market_cap_m": 0,
             "shares_outstanding_m": 0,
-            "float_shares": FLOAT_SHARES_MAP.get(symbol.upper(), 0),
         }
+        profile_cache[symbol] = profile
+        return profile
 
-    market_cap = safe_float(data.get("marketCapitalization"), 0)
-    shares_outstanding = safe_float(data.get("shareOutstanding"), 0)
-    float_shares = FLOAT_SHARES_MAP.get(symbol.upper(), 0)
-
-    return {
+    profile = {
         "name": str(data.get("name", "")).strip(),
-        "market_cap_m": market_cap,
-        "shares_outstanding_m": shares_outstanding,
-        "float_shares": float_shares,
+        "industry": str(data.get("finnhubIndustry", "")).strip() or "غير محدد",
+        "market_cap_m": safe_float(data.get("marketCapitalization"), 0),
+        "shares_outstanding_m": safe_float(data.get("shareOutstanding"), 0),
     }
+    profile_cache[symbol] = profile
+    return profile
 
 
 def get_candles(symbol: str):
@@ -374,24 +369,31 @@ def get_candles(symbol: str):
     avg_vol20 = safe_float(df["volume"].rolling(20, min_periods=20).mean().iloc[-1], 0)
     rvol = (last_1m_vol / avg_vol20) if avg_vol20 > 0 else 0.0
 
+    day_volume = safe_float(df["volume"].sum(), 0)
+
     typical = (df["high"] + df["low"] + df["close"]) / 3.0
     tpv = typical * df["volume"]
     vol_cum = df["volume"].cumsum()
 
     vwap = 0.0
-    if not vol_cum.empty and safe_float(vol_cum.iloc[-1], 0) > 0:
+    if safe_float(vol_cum.iloc[-1], 0) > 0:
         vwap = safe_float((tpv.cumsum() / vol_cum).iloc[-1], 0)
 
-    day_volume = safe_float(df["volume"].sum(), 0)
     above_vwap = price > vwap if vwap > 0 else False
 
-    # قوة آخر 3 دقائق
     last3 = df.tail(3).copy()
     first3_close = safe_float(last3.iloc[0]["close"], 0)
     last3_close = safe_float(last3.iloc[-1]["close"], 0)
-    momentum_3m_pct = 0.0
-    if first3_close > 0:
-        momentum_3m_pct = ((last3_close - first3_close) / first3_close) * 100
+    momentum_3m_pct = ((last3_close - first3_close) / first3_close) * 100 if first3_close > 0 else 0.0
+
+    whale_in = (
+        last_1m_vol >= max(5000, avg_vol20 * 2.2)
+        and minute_change_pct > 0
+        and above_vwap
+    )
+
+    current_liquidity_value = price * last_1m_vol
+    daily_liquidity_value = price * day_volume
 
     return {
         "minute_change_pct": round(minute_change_pct, 2),
@@ -399,12 +401,18 @@ def get_candles(symbol: str):
         "last_1m_vol": int(last_1m_vol),
         "avg_vol20": round(avg_vol20, 2),
         "rvol": round(rvol, 2),
-        "vwap": round(vwap, 4),
-        "day_volume": int(day_volume),
+        "vwap_side": "فوق" if above_vwap else "تحت",
         "above_vwap": above_vwap,
+        "day_volume": int(day_volume),
+        "whale_in": whale_in,
+        "current_liquidity": current_liquidity_value,
+        "daily_liquidity": daily_liquidity_value,
     }
 
 
+# =========================
+# SIGNAL ENGINE
+# =========================
 def classify_signal(day_change_pct, minute_change_pct, momentum_3m_pct, rvol, above_vwap):
     if (
         day_change_pct >= FAST_MIN_DAY_CHANGE
@@ -413,7 +421,7 @@ def classify_signal(day_change_pct, minute_change_pct, momentum_3m_pct, rvol, ab
         and rvol >= FAST_MIN_RVOL
         and above_vwap
     ):
-        return "دخول سريع"
+        return "تنبيه دخول سريع"
 
     if (
         day_change_pct >= TREND_MIN_DAY_CHANGE
@@ -421,124 +429,113 @@ def classify_signal(day_change_pct, minute_change_pct, momentum_3m_pct, rvol, ab
         and rvol >= TREND_MIN_RVOL
         and above_vwap
     ):
-        return "ترند اليوم"
+        return "تنبيه ترند"
 
     return None
 
 
-def detect_state(day_change_pct, minute_change_pct, rvol, above_vwap):
+def detect_state(day_change_pct, minute_change_pct, rvol, above_vwap, whale_in):
     if day_change_pct >= 5 and minute_change_pct < -0.20 and rvol >= 1.2 and not above_vwap:
         return "تصريف"
-
-    if day_change_pct >= 5 and minute_change_pct < 0 and above_vwap:
-        return "تصحيح"
-
-    if day_change_pct > 0 and minute_change_pct >= 0 and rvol >= 1 and above_vwap:
+    if whale_in:
+        return "دخول حوت"
+    if day_change_pct > 0 and minute_change_pct >= 0 and above_vwap:
         return "زخم إيجابي"
-
     return "طبيعي"
 
 
-def decide_action(signal_type, state):
+def decide_action(signal_type, state, above_vwap, minute_change_pct):
     if state == "تصريف":
         return "انتظار"
-    if signal_type in {"دخول سريع", "ترند اليوم"}:
+    if signal_type and above_vwap and minute_change_pct >= 0:
         return "دخول"
-    return "انتظار"
+    return "مراقبة"
 
 
-def calc_score(signal_type, day_change_pct, minute_change_pct, momentum_3m_pct, rvol, above_vwap):
+def breakout_text(above_vwap, minute_change_pct):
+    if above_vwap and minute_change_pct > 0:
+        return "اختراق إيجابي"
+    if above_vwap:
+        return "فوق الفواب"
+    return "تحت الفواب"
+
+
+def calc_power_score(day_change_pct, minute_change_pct, momentum_3m_pct, rvol, above_vwap, whale_in, day_volume):
     score = (
         max(0, day_change_pct) * 3
         + max(0, minute_change_pct) * 18
         + max(0, momentum_3m_pct) * 10
         + max(0, rvol) * 12
-        + (10 if above_vwap else 0)
+        + (12 if above_vwap else 0)
+        + (15 if whale_in else 0)
+        + min(day_volume / 500000, 15)
     )
-
-    if signal_type == "دخول سريع":
-        score += 18
-    elif signal_type == "ترند اليوم":
-        score += 10
-
     return round(score, 2)
 
 
-def size_label(market_cap_m):
-    mc = safe_float(market_cap_m, 0)
-    if mc <= 0:
-        return "غير محدد"
-    if mc < 300:
-        return "مايكرو"
-    if mc < 2_000:
-        return "صغيرة"
-    if mc < 10_000:
-        return "متوسطة"
-    if mc < 200_000:
-        return "كبيرة"
-    return "عملاقة"
-
-
-def build_alert_text(m: dict) -> str:
-    title = "تنبيه سهم"
-    if m["signal_type"] == "دخول سريع":
-        title = "تنبيه دخول سريع"
-    elif m["signal_type"] == "ترند اليوم":
-        title = "تنبيه ترند اليوم"
-
-    shares_outstanding_text = "غير متاح"
-    if m["shares_outstanding"] > 0:
-        shares_outstanding_text = fmt_num(m["shares_outstanding"])
-
-    float_shares_text = "غير متاح"
-    if m["float_shares"] > 0:
-        float_shares_text = fmt_num(m["float_shares"])
-
-    market_cap_text = "غير متاح"
-    if m["market_cap"] > 0:
-        market_cap_text = fmt_num(m["market_cap"])
+# =========================
+# FORMAT
+# =========================
+def build_stock_alert_text(m: dict) -> str:
+    alert_no = get_alert_number(m["symbol"])
 
     lines = [
-        f"📢 {title}",
+        f"📢 {m['signal_type']} | رقم {alert_no}",
         "",
-        f"السهم: {m['symbol']}",
-        f"النوع: {m['signal_type']}",
-        f"القرار: {m['decision']}",
-        f"الحالة: {m['state']}",
-        f"الشرعية: {m['shariah']}",
-        f"الجلسة: {get_session_label()}",
-        f"السعر: {m['price']}",
-        f"التغير اليومي: {pct_str(m['day_change_pct'])}",
-        f"تغير آخر دقيقة: {pct_str(m['minute_change_pct'])}",
-        f"زخم 3 دقائق: {pct_str(m['momentum_3m_pct'])}",
-        f"حجم التداول: {fmt_num(m['day_volume'])}",
-        f"فوليوم آخر دقيقة: {fmt_num(m['last_1m_vol'])}",
-        f"متوسط 20 دقيقة: {fmt_num(m['avg_vol20'])}",
-        f"RVOL: {m['rvol']}",
-        f"VWAP: {m['vwap']}",
-        f"فوق VWAP: {'نعم' if m['above_vwap'] else 'لا'}",
-        f"القيمة السوقية: {market_cap_text}",
-        f"حجم الشركة: {m['company_size']}",
-        f"عدد أسهم الشركة: {shares_outstanding_text}",
-        f"الأسهم المطروحة: {float_shares_text}",
-        f"السكور: {m['score']}",
+        tag_line("🏷️", "السهم", m["symbol"]),
+        tag_line("💵", "السعر", m["price"]),
+        tag_line("📈", "التغير اليومي", pct_str(m["day_change_pct"])),
+        tag_line("⏱️", "آخر دقيقة", pct_str(m["minute_change_pct"])),
+        tag_line("🚀", "زخم 3 دقائق", pct_str(m["momentum_3m_pct"])),
+        tag_line("🧠", "الحالة", m["state"]),
+        tag_line("✅", "القرار", m["decision"]),
+        tag_line("🧩", "الاختراق", m["breakout_text"]),
+        tag_line("🏭", "نشاط الشركة", m["industry"]),
+        tag_line("🕒", "الجلسة", get_session_label()),
+        tag_line("📍", "VWAP", m["vwap_side"]),
+        tag_line("🐋", "دخول حوت", label_bool(m["whale_in"])),
+        tag_line("💰", "السيولة الآن", fmt_num(m["current_liquidity"])),
+        tag_line("🪙", "سيولة آخر دقيقة", fmt_num(m["last_1m_vol"])),
+        tag_line("📊", "حجم التداول", fmt_num(m["day_volume"])),
+        tag_line("📶", "RVOL", m["rvol"]),
+        tag_line("🏢", "حجم الشركة", m["company_size"]),
+        tag_line("🧮", "عدد الأسهم", fmt_num(m["shares_outstanding"]) if m["shares_outstanding"] > 0 else "غير متاح"),
+        tag_line("📦", "الأسهم المطروحة", fmt_num(m["float_shares"]) if m["float_shares"] > 0 else "غير متاح"),
+        tag_line("🏛️", "القيمة السوقية", fmt_num(m["market_cap"]) if m["market_cap"] > 0 else "غير متاح"),
+        tag_line("⭐", "السكور", m["power_score"]),
     ]
-
     return "\n".join(lines)
 
 
-def scan_once():
+def build_top_list_text(title: str, rows: list, rank_key: str) -> str:
+    lines = [f"🏆 {title}", f"🕒 الجلسة: {get_session_label()}", ""]
+
+    for i, row in enumerate(rows, start=1):
+        whale = "🐋" if row["whale_in"] else "•"
+        lines.append(
+            f"{i}) {row['symbol']} | {row['price']} | {pct_str(row['day_change_pct'])} | "
+            f"1m {pct_str(row['minute_change_pct'])} | RVOL {row['rvol']} | VWAP {row['vwap_side']} | {whale} | {row['industry']}"
+        )
+
+    lines.append("")
+    lines.append(f"📌 الترتيب: {rank_key}")
+    return "\n".join(lines)
+
+
+# =========================
+# CORE SCAN
+# =========================
+def scan_market():
     symbols = get_market_symbols()
     logging.info("Scanning %s symbols...", len(symbols))
 
-    ranked = []
+    collected = []
     stats = {
         "total": 0,
         "quote_fail": 0,
         "price_filtered": 0,
         "candle_fail": 0,
         "volume_filtered": 0,
-        "signal_filtered": 0,
         "accepted": 0,
     }
 
@@ -566,16 +563,18 @@ def scan_once():
             stats["candle_fail"] += 1
             continue
 
+        day_volume = int(candles["day_volume"])
+        last_1m_vol = int(candles["last_1m_vol"])
+
+        if day_volume < MIN_DAY_VOLUME or last_1m_vol < MIN_LAST_1M_VOL:
+            stats["volume_filtered"] += 1
+            continue
+
         minute_change_pct = safe_float(candles["minute_change_pct"], 0)
         momentum_3m_pct = safe_float(candles["momentum_3m_pct"], 0)
         rvol = safe_float(candles["rvol"], 0)
         above_vwap = bool(candles["above_vwap"])
-        last_1m_vol = int(candles["last_1m_vol"])
-        day_volume = int(candles["day_volume"])
-
-        if last_1m_vol < MIN_LAST_1M_VOL or day_volume < MIN_DAY_VOLUME:
-            stats["volume_filtered"] += 1
-            continue
+        whale_in = bool(candles["whale_in"])
 
         signal_type = classify_signal(
             day_change_pct=day_change_pct,
@@ -584,97 +583,141 @@ def scan_once():
             rvol=rvol,
             above_vwap=above_vwap,
         )
-        if not signal_type:
-            stats["signal_filtered"] += 1
-            continue
-
-        profile = get_profile(symbol)
-        time.sleep(REQUEST_DELAY)
 
         state = detect_state(
             day_change_pct=day_change_pct,
             minute_change_pct=minute_change_pct,
             rvol=rvol,
             above_vwap=above_vwap,
+            whale_in=whale_in,
         )
-        decision = decide_action(signal_type, state)
 
-        score = calc_score(
+        decision = decide_action(
             signal_type=signal_type,
+            state=state,
+            above_vwap=above_vwap,
+            minute_change_pct=minute_change_pct,
+        )
+
+        power_score = calc_power_score(
             day_change_pct=day_change_pct,
             minute_change_pct=minute_change_pct,
             momentum_3m_pct=momentum_3m_pct,
             rvol=rvol,
             above_vwap=above_vwap,
+            whale_in=whale_in,
+            day_volume=day_volume,
         )
+
+        profile = get_profile(symbol)
 
         market_cap_value = safe_float(profile.get("market_cap_m", 0), 0) * 1_000_000
         shares_outstanding_value = safe_float(profile.get("shares_outstanding_m", 0), 0) * 1_000_000
-        float_shares_value = safe_float(profile.get("float_shares", 0), 0)
 
-        ranked.append({
+        # مبدئيًا خلي الأسهم المطروحة = غير متاح
+        # نقدر نضيفها لاحقًا بمصدر آخر أو متغير خارجي
+        float_shares_value = 0
+
+        row = {
             "symbol": symbol,
-            "signal_type": signal_type,
-            "decision": decision,
-            "state": state,
-            "shariah": get_shariah_status(symbol),
             "price": round(price, 4),
             "day_change_pct": round(day_change_pct, 2),
             "minute_change_pct": round(minute_change_pct, 2),
             "momentum_3m_pct": round(momentum_3m_pct, 2),
-            "day_volume": day_volume,
+            "signal_type": signal_type or "تنبيه متابعة",
+            "decision": decision,
+            "state": state,
+            "breakout_text": breakout_text(above_vwap, minute_change_pct),
+            "industry": profile.get("industry", "غير محدد"),
+            "vwap_side": candles["vwap_side"],
+            "above_vwap": above_vwap,
+            "whale_in": whale_in,
+            "current_liquidity": candles["current_liquidity"],
+            "daily_liquidity": candles["daily_liquidity"],
             "last_1m_vol": last_1m_vol,
+            "day_volume": day_volume,
             "avg_vol20": candles["avg_vol20"],
             "rvol": round(rvol, 2),
-            "vwap": candles["vwap"],
-            "above_vwap": above_vwap,
             "market_cap": market_cap_value,
             "company_size": size_label(profile.get("market_cap_m", 0)),
             "shares_outstanding": shares_outstanding_value,
             "float_shares": float_shares_value,
-            "score": score,
-        })
+            "power_score": power_score,
+        }
 
+        collected.append(row)
         stats["accepted"] += 1
 
-        logging.info(
-            "%s | type=%s | decision=%s | state=%s | score=%s",
-            symbol, signal_type, decision, state, score
-        )
+    logging.info("Scan summary: %s", stats)
+    return collected
 
-    ranked.sort(key=lambda x: x["score"], reverse=True)
 
-    logging.info(
-        "Scan summary | total=%s | quote_fail=%s | price_filtered=%s | candle_fail=%s | volume_filtered=%s | signal_filtered=%s | accepted=%s",
-        stats["total"],
-        stats["quote_fail"],
-        stats["price_filtered"],
-        stats["candle_fail"],
-        stats["volume_filtered"],
-        stats["signal_filtered"],
-        stats["accepted"],
-    )
+def send_top_lists_if_changed(collected: list):
+    global last_top_gainers_hash, last_top_power_hash
 
-    if not ranked:
-        logging.info("No signals found.")
+    if not collected:
         return
 
-    sent_count = 0
+    top_gainers = sorted(
+        collected,
+        key=lambda x: (x["day_change_pct"], x["minute_change_pct"], x["rvol"]),
+        reverse=True
+    )[:TOP_GAINERS_COUNT]
 
-    for m in ranked[:TOP_ALERTS_PER_SCAN]:
-        if not should_send(m["symbol"], m["price"]):
-            logging.info("Skipped resend for %s بسبب cooldown", m["symbol"])
+    top_power = sorted(
+        collected,
+        key=lambda x: x["power_score"],
+        reverse=True
+    )[:TOP_POWER_COUNT]
+
+    gainers_hash = make_rows_hash(top_gainers, ["symbol", "day_change_pct", "minute_change_pct", "rvol"])
+    power_hash = make_rows_hash(top_power, ["symbol", "power_score", "day_change_pct", "minute_change_pct"])
+
+    if gainers_hash != last_top_gainers_hash:
+        if send_telegram_message(build_top_list_text("أفضل 5 الأكثر ارتفاعًا الآن", top_gainers, "التغير اليومي")):
+            last_top_gainers_hash = gainers_hash
+            logging.info("Top gainers list sent.")
+
+    if power_hash != last_top_power_hash:
+        if send_telegram_message(build_top_list_text("أفضل 5 الأقوى الآن", top_power, "السكور")):
+            last_top_power_hash = power_hash
+            logging.info("Top power list sent.")
+
+
+def send_dynamic_stock_alerts(collected: list):
+    if not collected:
+        return
+
+    alert_candidates = [
+        x for x in collected
+        if x["signal_type"] in {"تنبيه دخول سريع", "تنبيه ترند"} or x["whale_in"]
+    ]
+
+    alert_candidates = sorted(
+        alert_candidates,
+        key=lambda x: (x["power_score"], x["day_change_pct"], x["minute_change_pct"]),
+        reverse=True
+    )
+
+    sent = 0
+    for row in alert_candidates:
+        symbol = row["symbol"]
+        price = row["price"]
+
+        if alert_counter.get(symbol, 0) >= ALERT_MAX_PER_SYMBOL:
             continue
 
-        text = build_alert_text(m)
+        if not should_send(symbol, price):
+            continue
 
+        text = build_stock_alert_text(row)
         if send_telegram_message(text):
-            mark_sent(m["symbol"], m["price"])
-            sent_count += 1
-            logging.info("Alert sent for %s", m["symbol"])
+            mark_sent(symbol, price)
+            sent += 1
+            logging.info("Dynamic alert sent for %s", symbol)
 
-    if sent_count == 0:
-        logging.info("No alerts sent this round.")
+    if sent == 0:
+        logging.info("No dynamic alerts sent this round.")
 
 
 def main():
@@ -684,21 +727,21 @@ def main():
         return
 
     startup = (
-        "✅ البوت اشتغل بنسخة احترافية على Finnhub فقط\n"
-        "لا يستخدم yfinance\n"
-        f"عدد الأسهم المراقبة: {len(get_market_symbols())}\n"
-        f"الجلسة الحالية: {get_session_label()}\n"
-        f"DEBUG_MODE: {'ON' if DEBUG_MODE else 'OFF'}\n"
-        "يرسل:\n"
-        "1) دخول سريع\n"
-        "2) ترند اليوم\n"
-        "ويعرض القرار والحالة والشرعية وحجم الشركة"
+        "✅ البوت اشتغل بنسخة v2 الديناميكية\n"
+        "يفحص السوق الأمريكي ويستخرج الأسهم الصاعدة والترند تلقائيًا\n"
+        "يرسل قائمة التوب فقط إذا تغيرت فعلاً\n"
+        "ويرسل تنبيهات متتابعة للسهم إذا تغير السعر وتحسنت الإشارة\n"
+        f"🕒 الجلسة الحالية: {get_session_label()}\n"
+        f"📦 SCAN_SYMBOL_LIMIT: {SCAN_SYMBOL_LIMIT}"
     )
     send_telegram_message(startup)
 
     while True:
         try:
-            scan_once()
+            collected = scan_market()
+            send_top_lists_if_changed(collected)
+            time.sleep(1)
+            send_dynamic_stock_alerts(collected)
         except Exception as e:
             logging.exception("Main loop error: %s", e)
 
