@@ -1,122 +1,209 @@
+import os
+import yfinance as yf
+import pandas as pd
 import requests
-import time
 
-# ====== الإعدادات ======
-TELEGRAM_TOKEN = "8727048281:AAHj5QrnJtkp84g1JwzhtWwNiB0_EleqWcY"
-CHAT_ID = "718432991"
-FINNHUB_API_KEY = "d6s44g9r01qrb5i8hvegd6s44g9r01qrb5i8hvf0"
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, SMAIndicator
 
-tracked = {}  # الأسهم اللي نراقبها
-sent = set()  # الأسهم اللي أرسلناها
+from telegram import Update
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
-# ====== إرسال ======
-def send_alert(symbol, price, change):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    
-    text = f"""🚀 تم الصيد!
+# =========================
+# التوكن من Railway
+# =========================
+BOT_TOKEN = os.getenv("8727048281:AAHj5QrnJtkp84g1JwzhtWwNiB0_EleqWcY")
 
-السهم: {symbol}
-السعر: {price}
-التغير: {change}%
+# =========================
+# جلب بيانات السهم
+# =========================
+def get_data(symbol):
+    ticker = yf.Ticker(symbol)
+    info = ticker.info
+    hist = ticker.history(period="6mo", interval="1d")
 
-🔥 انفجار مؤكد"""
+    if hist.empty:
+        return None, None
+
+    return info, hist
+
+
+# =========================
+# التحليل الفني المتقدم
+# =========================
+def technical_analysis(hist):
+    df = hist.copy()
+
+    close = df["Close"]
+
+    # RSI
+    rsi = RSIIndicator(close).rsi().iloc[-1]
+
+    # MACD
+    macd = MACD(close)
+    macd_line = macd.macd().iloc[-1]
+    macd_signal = macd.macd_signal().iloc[-1]
+
+    # Moving Averages
+    ma20 = SMAIndicator(close, window=20).sma_indicator().iloc[-1]
+    ma50 = SMAIndicator(close, window=50).sma_indicator().iloc[-1]
+
+    signals = []
+    score = 0
+
+    # RSI
+    if rsi < 30:
+        signals.append("RSI: تشبع بيع 🔥")
+        score += 2
+    elif rsi > 70:
+        signals.append("RSI: تشبع شراء ⚠️")
+        score -= 2
+    else:
+        signals.append("RSI: طبيعي")
+
+    # MACD
+    if macd_line > macd_signal:
+        signals.append("MACD: صاعد 📈")
+        score += 1
+    else:
+        signals.append("MACD: هابط 📉")
+        score -= 1
+
+    # MA
+    last_price = close.iloc[-1]
+
+    if last_price > ma20:
+        signals.append("فوق MA20 ✅")
+        score += 1
+    else:
+        signals.append("تحت MA20 ❌")
+        score -= 1
+
+    if last_price > ma50:
+        signals.append("فوق MA50 ✅")
+        score += 1
+    else:
+        signals.append("تحت MA50 ❌")
+        score -= 1
+
+    return signals, score, last_price, df
+
+
+# =========================
+# دعم ومقاومة
+# =========================
+def support_resistance(df):
+    support = df["Close"].min()
+    resistance = df["Close"].max()
+    return support, resistance
+
+
+# =========================
+# الأخبار
+# =========================
+def get_news(symbol):
+    try:
+        url = f"https://query1.finance.yahoo.com/v1/finance/search?q={symbol}"
+        res = requests.get(url).json()
+        news = res.get("news", [])[:3]
+
+        result = ""
+        for n in news:
+            result += f"- {n.get('title')}\n"
+
+        return result if result else "لا توجد أخبار"
+    except:
+        return "تعذر جلب الأخبار"
+
+
+# =========================
+# الشرعية (مبدئي)
+# =========================
+def sharia_check(info):
+    sector = info.get("sector", "").lower()
+
+    if "financial" in sector or "bank" in sector:
+        return "❌ غير متوافق (قطاع مالي)"
+    return "⚖️ يحتاج مراجعة إضافية"
+
+
+# =========================
+# تقييم نهائي
+# =========================
+def get_signal(score):
+    if score >= 3:
+        return "🟢 Strong Buy"
+    elif score == 2:
+        return "🟢 Buy"
+    elif score == 1 or score == 0:
+        return "🟡 Neutral"
+    else:
+        return "🔴 Sell"
+
+
+# =========================
+# المعالج الرئيسي
+# =========================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    symbol = update.message.text.strip().upper()
 
     try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text})
-    except:
-        pass
+        info, hist = get_data(symbol)
 
-# ====== فلتر رموز ======
-def is_valid_symbol(symbol):
-    return symbol.isalpha() and 3 <= len(symbol) <= 4
+        if hist is None:
+            await update.message.reply_text("❌ السهم غير موجود")
+            return
 
-# ====== جلب الأسهم (فلترة قوية) ======
-def get_symbols():
-    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
-    
-    try:
-        data = requests.get(url).json()
+        tech_signals, score, price, df = technical_analysis(hist)
+        support, resistance = support_resistance(df)
 
-        symbols = []
+        news = get_news(symbol)
+        sharia = sharia_check(info)
 
-        for x in data:
-            s = x.get("symbol", "")
-            d = x.get("description", "").lower()
+        signal = get_signal(score)
 
-            if not is_valid_symbol(s):
-                continue
+        response = f"""
+📊 {symbol}
 
-            if any(w in d for w in ["adr", "holding", "acquisition", "capital", "fund"]):
-                continue
+💰 السعر: {price:.2f}
 
-            symbols.append(s)
+📈 التحليل الفني:
+{chr(10).join(tech_signals)}
 
-        return symbols[:250]  # 👈 نخليها خفيفة وسريعة
+🎯 التقييم:
+Score: {score}
+Signal: {signal}
 
-    except:
-        return []
+📉 الدعم: {support:.2f}
+📈 المقاومة: {resistance:.2f}
 
-# ====== جلب السعر ======
-def get_price(symbol):
-    try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-        data = requests.get(url).json()
+📰 الأخبار:
+{news}
 
-        price = data.get("c", 0)
-        prev = data.get("pc", 0)
+⚖️ الشرعية:
+{sharia}
 
-        if price == 0 or prev == 0:
-            return None
+🏢 الشركة:
+{info.get("longBusinessSummary", "لا يوجد وصف")[:400]}...
+"""
 
-        change = ((price - prev) / prev) * 100
+        await update.message.reply_text(response)
 
-        return price, change
+    except Exception as e:
+        await update.message.reply_text("⚠️ حدث خطأ في التحليل")
 
-    except:
-        return None
 
-# ====== منطق الصيد ======
-def hunter_logic(symbol, price, change):
-    
-    # المرحلة 1: رصد مبكر
-    if symbol not in tracked:
-        if 1 <= change <= 3:
-            tracked[symbol] = price
-            print(f"👀 تم رصد: {symbol}")
-        return
+# =========================
+# تشغيل البوت
+# =========================
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # المرحلة 2: تأكيد الانفجار
-    start_price = tracked[symbol]
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    move = ((price - start_price) / start_price) * 100
+    print("🚀 Bot Running...")
+    app.run_polling()
 
-    if move >= 2 and symbol not in sent:
-        print(f"🔥 تم الصيد: {symbol}")
-        send_alert(symbol, round(price,2), round(change,2))
-        sent.add(symbol)
 
-# ====== التشغيل ======
-def run_bot():
-    symbols = get_symbols()
-
-    print(f"🎯 عدد الأسهم بعد الفلترة: {len(symbols)}")
-
-    while True:
-        for symbol in symbols:
-
-            data = get_price(symbol)
-
-            if not data:
-                continue
-
-            price, change = data
-
-            if price < 2:  # استبعاد الرخيص
-                continue
-
-            hunter_logic(symbol, price, change)
-
-        time.sleep(30)  # أسرع = أدق
-
-# ====== تشغيل ======
-run_bot()
+if __name__ == "__main__":
+    main()
