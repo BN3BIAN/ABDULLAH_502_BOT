@@ -6,111 +6,117 @@ TELEGRAM_TOKEN = "8727048281:AAHj5QrnJtkp84g1JwzhtWwNiB0_EleqWcY"
 CHAT_ID = "718432991"
 FINNHUB_API_KEY = "d6s44g9r01qrb5i8hvegd6s44g9r01qrb5i8hvf0"
 
-# ====== إرسال تيليجرام ======
-def send_alert(symbol, price, change, volume):
+tracked = {}  # الأسهم اللي نراقبها
+sent = set()  # الأسهم اللي أرسلناها
+
+# ====== إرسال ======
+def send_alert(symbol, price, change):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
-    text = f"""🚀 دخول مبكر!
+    text = f"""🚀 تم الصيد!
 
 السهم: {symbol}
 السعر: {price}
 التغير: {change}%
-الحجم: {volume}
 
-⚡ ممكن انفجار قريب"""
-
-    data = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
+🔥 انفجار مؤكد"""
 
     try:
-        requests.post(url, data=data)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": text})
     except:
         pass
 
-# ====== فلتر الرموز ======
+# ====== فلتر رموز ======
 def is_valid_symbol(symbol):
     return symbol.isalpha() and 3 <= len(symbol) <= 4
 
-# ====== جلب الأسهم ======
+# ====== جلب الأسهم (فلترة قوية) ======
 def get_symbols():
     url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_API_KEY}"
     
     try:
         data = requests.get(url).json()
-        return [x["symbol"] for x in data if is_valid_symbol(x["symbol"])]
+
+        symbols = []
+
+        for x in data:
+            s = x.get("symbol", "")
+            d = x.get("description", "").lower()
+
+            if not is_valid_symbol(s):
+                continue
+
+            if any(w in d for w in ["adr", "holding", "acquisition", "capital", "fund"]):
+                continue
+
+            symbols.append(s)
+
+        return symbols[:250]  # 👈 نخليها خفيفة وسريعة
+
     except:
         return []
 
-# ====== بيانات سهم ======
-def get_data(symbol):
+# ====== جلب السعر ======
+def get_price(symbol):
     try:
-        quote_url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
-        profile_url = f"https://finnhub.io/api/v1/stock/profile2?symbol={symbol}&token={FINNHUB_API_KEY}"
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_API_KEY}"
+        data = requests.get(url).json()
 
-        quote = requests.get(quote_url).json()
-        profile = requests.get(profile_url).json()
+        price = data.get("c", 0)
+        prev = data.get("pc", 0)
 
-        price = quote.get("c", 0)
-        prev = quote.get("pc", 0)
-        open_price = quote.get("o", 0)
-
-        volume = profile.get("shareOutstanding", 0)  # تقريب للسيولة
-
-        if price == 0 or prev == 0 or open_price == 0:
+        if price == 0 or prev == 0:
             return None
 
         change = ((price - prev) / prev) * 100
 
-        return price, change, open_price, volume
+        return price, change
 
     except:
         return None
 
-# ====== فلتر قبل الانفجار ======
-def is_early_move(price, change, open_price, volume):
+# ====== منطق الصيد ======
+def hunter_logic(symbol, price, change):
     
-    if price < 2:  # استبعاد الرخيص جدًا
-        return False
+    # المرحلة 1: رصد مبكر
+    if symbol not in tracked:
+        if 1 <= change <= 3:
+            tracked[symbol] = price
+            print(f"👀 تم رصد: {symbol}")
+        return
 
-    if change < 1 or change > 5:  # حركة مبكرة
-        return False
+    # المرحلة 2: تأكيد الانفجار
+    start_price = tracked[symbol]
 
-    if price < open_price:  # لازم فوق الافتتاح
-        return False
+    move = ((price - start_price) / start_price) * 100
 
-    if volume < 10000000:  # سيولة قوية (تقدير)
-        return False
-
-    return True
+    if move >= 2 and symbol not in sent:
+        print(f"🔥 تم الصيد: {symbol}")
+        send_alert(symbol, round(price,2), round(change,2))
+        sent.add(symbol)
 
 # ====== التشغيل ======
 def run_bot():
-    sent = set()
     symbols = get_symbols()
 
-    print(f"📊 عدد الأسهم: {len(symbols)}")
+    print(f"🎯 عدد الأسهم بعد الفلترة: {len(symbols)}")
 
     while True:
-        for symbol in symbols[:80]:
+        for symbol in symbols:
 
-            if symbol in sent:
-                continue
-
-            data = get_data(symbol)
+            data = get_price(symbol)
 
             if not data:
                 continue
 
-            price, change, open_price, volume = data
+            price, change = data
 
-            if is_early_move(price, change, open_price, volume):
-                print(f"⚡ دخول مبكر: {symbol}")
-                send_alert(symbol, round(price,2), round(change,2), volume)
-                sent.add(symbol)
+            if price < 2:  # استبعاد الرخيص
+                continue
 
-        time.sleep(60)
+            hunter_logic(symbol, price, change)
+
+        time.sleep(30)  # أسرع = أدق
 
 # ====== تشغيل ======
 run_bot()
