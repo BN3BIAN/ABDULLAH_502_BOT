@@ -12,7 +12,7 @@ from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTyp
 # =========================
 # التوكن من Railway
 # =========================
-BOT_TOKEN = os.getenv("8727048281:AAHj5QrnJtkp84g1JwzhtWwNiB0_EleqWcY")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 # =========================
 # جلب بيانات السهم
