@@ -5,7 +5,7 @@ import json
 
 # ====== الإعدادات ======
 TELEGRAM_TOKEN = "8727048281:AAHj5QrnJtkp84g1JwzhtWwNiB0_EleqWcY"
-CHAT_ID = "718432991"5i8hvf
+CHAT_ID = "718432991"
 FINNHUB_API_KEY = "d6s44g9r01qrb5i8hvegd6s44g9r01qrb5i8hvf0"
 
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
