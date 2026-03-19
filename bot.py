@@ -1,11 +1,10 @@
 import requests
 import time
 import telegram
-import json
 
 # ====== الإعدادات ======
 TELEGRAM_TOKEN = "8727048281:AAHj5QrnJtkp84g1JwzhtWwNiB0_EleqWcY"
-CHAT_ID = "718432991"
+CHAT_ID = 718432991
 FINNHUB_API_KEY = "d6s44g9r01qrb5i8hvegd6s44g9r01qrb5i8hvf0"
 
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
@@ -15,7 +14,6 @@ def is_valid_symbol(symbol):
     if not symbol:
         return False
     
-    # فقط 3-4 حروف (مثل ما طلبت)
     if not symbol.isalpha():
         return False
     
@@ -31,8 +29,15 @@ def get_stocks():
     try:
         response = requests.get(url)
 
-        # 🔥 أهم سطر (حل المشكلة)
-        data = response.json()
+        if response.status_code != 200:
+            print("❌ فشل الاتصال:", response.status_code)
+            return []
+
+        try:
+            data = response.json()
+        except:
+            print("❌ الرد مو JSON")
+            return []
 
         if not isinstance(data, list):
             print("❌ البيانات مو قائمة")
@@ -41,10 +46,10 @@ def get_stocks():
         return data
 
     except Exception as e:
-        print("❌ خطأ في جلب البيانات:", e)
+        print("❌ خطأ:", e)
         return []
 
-# ====== فلترة متقدمة ======
+# ====== فلترة ======
 def filter_stocks(stocks):
     filtered = []
 
@@ -53,11 +58,9 @@ def filter_stocks(stocks):
             symbol = stock.get("symbol", "")
             desc = stock.get("description", "").lower()
 
-            # فلتر الرموز
             if not is_valid_symbol(symbol):
                 continue
 
-            # استبعاد الشركات الغير مرغوبة
             if any(x in desc for x in ["acquisition", "holdings", "adr", "capital"]):
                 continue
 
@@ -68,14 +71,14 @@ def filter_stocks(stocks):
 
     return filtered
 
-# ====== إرسال تنبيه ======
+# ====== إرسال ======
 def send_alert(symbol):
     try:
         bot.send_message(chat_id=CHAT_ID, text=f"🚀 فرصة محتملة: {symbol}")
     except Exception as e:
-        print("خطأ إرسال:", e)
+        print("❌ خطأ إرسال:", e)
 
-# ====== التشغيل ======
+# ====== تشغيل ======
 def run_bot():
     sent = set()
 
@@ -83,14 +86,13 @@ def run_bot():
         stocks = get_stocks()
         filtered = filter_stocks(stocks)
 
-        print(f"📊 عدد الأسهم بعد الفلترة: {len(filtered)}")
+        print(f"📊 بعد الفلترة: {len(filtered)}")
 
-        for symbol in filtered[:10]:  # نأخذ أفضل 10 فقط
+        for symbol in filtered:
             if symbol not in sent:
                 send_alert(symbol)
                 sent.add(symbol)
 
-        time.sleep(60)  # كل دقيقة
+        time.sleep(60)
 
-# ====== تشغيل ======
 run_bot()
